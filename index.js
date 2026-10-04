@@ -14,6 +14,7 @@ const landingTemplate = require("stremio-addon-sdk/src/landingTemplate");
 const { XMLParser } = require("fast-xml-parser");
 const cheerio = require("cheerio");
 const crypto = require("crypto");
+const { fetchAlfaTorrentSource } = require("./alfa-torrents.js");
 
 const TORRENTIO_BASE = "https://torrentio.strem.fun";
 const TORBOX_API = "https://api.torbox.app/v1/api";
@@ -72,6 +73,24 @@ const manifest = {
 			key: "srcGrantorrent",
 			type: "checkbox",
 			title: "Fuente: GranTorrent (torrents latino — pelis y series)",
+			default: "checked",
+		},
+		{
+			key: "srcElitetorrent",
+			type: "checkbox",
+			title: "Fuente: EliteTorrent (torrents latino — pelis y series)",
+			default: "checked",
+		},
+		{
+			key: "srcMitorrent",
+			type: "checkbox",
+			title: "Fuente: MiTorrent (torrents latino — pelis y series)",
+			default: "checked",
+		},
+		{
+			key: "srcHacktorrent",
+			type: "checkbox",
+			title: "Fuente: HackTorrent (torrents latino — pelis y series)",
 			default: "checked",
 		},
 		{
@@ -648,7 +667,7 @@ async function fetchTorznab(torznabUrl, torznabKey, type, id, season, episode) {
 
 // Orquesta todas las fuentes en paralelo, con fallback automático
 async function fetchAllSources(type, id, { season, episode, config }) {
-	const cacheKey = `all:${type}:${id}:${config.srcTorrentio ? 1 : 0}${config.srcEztv ? 1 : 0}${config.srcGrantorrent ? 1 : 0}:${shortHash(config.extraSources)}:${shortHash(config.torznabUrl)}`;
+	const cacheKey = `all:${type}:${id}:${config.srcTorrentio ? 1 : 0}${config.srcEztv ? 1 : 0}${config.srcGrantorrent ? 1 : 0}${config.srcElitetorrent ? 1 : 0}${config.srcMitorrent ? 1 : 0}${config.srcHacktorrent ? 1 : 0}:${shortHash(config.extraSources)}:${shortHash(config.torznabUrl)}`;
 	const hit = cacheGet(cacheKey);
 	if (hit) return hit;
 
@@ -676,6 +695,20 @@ async function fetchAllSources(type, id, { season, episode, config }) {
 				return [];
 			})
 		);
+	}
+	for (const [cfgKey, srcId] of [
+		["srcElitetorrent", "elitetorrent"],
+		["srcMitorrent", "mitorrent"],
+		["srcHacktorrent", "hacktorrent"],
+	]) {
+		if (config[cfgKey] !== false) {
+			jobs.push(
+				fetchAlfaTorrentSource(srcId, type, id, season, episode).catch((e) => {
+					console.warn(`${srcId} falló:`, e.message);
+					return [];
+				})
+			);
+		}
 	}
 	for (const origin of parseExtraSourceUrls(config.extraSources)) {
 		jobs.push(
@@ -900,6 +933,9 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 				srcTorrentio: config.srcTorrentio !== false,
 				srcEztv: config.srcEztv !== false,
 				srcGrantorrent: config.srcGrantorrent !== false,
+				srcElitetorrent: config.srcElitetorrent !== false,
+				srcMitorrent: config.srcMitorrent !== false,
+				srcHacktorrent: config.srcHacktorrent !== false,
 				extraSources: config.extraSources || "",
 				torznabUrl: (config.torznabUrl || "").trim(),
 				torznabKey: config.torznabKey || "",
