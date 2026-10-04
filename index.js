@@ -1005,7 +1005,78 @@ const app = express();
 // Página de configuración auto-generada (formulario con la API key de TorBox)
 app.get("/configure", (req, res) => {
 	res.setHeader("content-type", "text/html; charset=utf-8");
-	res.end(landingTemplate(manifest));
+	res.end(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Configurar Latino Streams ⚡</title>
+<style>
+*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0f1420;color:#e8ecf4;margin:0;padding:20px}
+.card{max-width:620px;margin:0 auto;background:#182030;border-radius:16px;padding:28px;box-shadow:0 8px 40px rgba(0,0,0,.4)}
+h1{margin:0 0 4px;font-size:1.5em}p.sub{color:#9aa4b8;margin:0 0 20px;font-size:.9em}
+.field{margin-bottom:14px}.field label{display:block;font-weight:600;margin-bottom:6px;font-size:.92em}
+.field input[type=text],.field input[type=password],.field select{width:100%;padding:10px 12px;border-radius:8px;border:1px solid #2a3448;background:#0b0f18;color:#e8ecf4;font-size:.95em}
+.check{display:flex;align-items:center;gap:10px;padding:10px 12px;background:#0b0f18;border-radius:8px;margin-bottom:8px;cursor:pointer}
+.check input{width:18px;height:18px;accent-color:#6c5ce7}
+.check span{font-size:.92em}
+.btn{display:block;width:100%;margin-top:18px;padding:14px;background:#6c5ce7;color:#fff;border:none;border-radius:10px;font-size:1em;font-weight:700;cursor:pointer}
+.btn:hover{background:#5a4bd1}
+#result{display:none;margin-top:20px;padding:16px;background:#0b0f18;border-radius:10px;border:1px solid #6c5ce7}
+#result p{margin:0 0 10px;font-size:.9em;color:#9aa4b8}
+#manifestUrl{width:100%;padding:10px;background:#182030;border:1px solid #2a3448;border-radius:8px;color:#7bed9f;font-family:monospace;font-size:.82em;word-break:break-all}
+.copybtn{margin-top:10px;padding:10px 20px;background:#2a3448;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600}
+.steps{margin-top:16px;font-size:.88em;color:#9aa4b8;line-height:1.7}
+.steps b{color:#e8ecf4}
+</style></head><body><div class="card">
+<h1>Latino Streams ⚡</h1>
+<p class="sub">Configura tus fuentes y obtén tu enlace de instalación para Nuvio / Stremio</p>
+<form id="cfg">
+<div class="field"><label>TorBox API Key (recomendado)</label><input type="password" id="torboxKey" placeholder="Pégala aquí (torbox.app → Settings → API)"></div>
+<div class="check"><input type="checkbox" id="instantOnly" checked><span>Solo fuentes instantáneas (ya en caché de TorBox)</span></div>
+<div class="field"><label>Máximo de resultados</label><select id="maxResults"><option>4</option><option>6</option><option selected>8</option><option>10</option><option>12</option></select></div>
+<div class="check"><input type="checkbox" id="srcTorrentio" checked><span>Torrentio (agregador principal)</span></div>
+<div class="check"><input type="checkbox" id="srcEztv" checked><span>EZTV (respaldo series)</span></div>
+<div class="check"><input type="checkbox" id="srcGrantorrent" checked><span>GranTorrent (latino)</span></div>
+<div class="check"><input type="checkbox" id="srcElitetorrent" checked><span>EliteTorrent (latino)</span></div>
+<div class="check"><input type="checkbox" id="srcMitorrent" checked><span>MiTorrent (latino)</span></div>
+<div class="check"><input type="checkbox" id="srcHacktorrent" checked><span>HackTorrent (latino)</span></div>
+<div class="field"><label>Addons extra (opcional, una URL por línea)</label><input type="text" id="extraSources" placeholder="https://..."></div>
+<div class="field"><label>URL Torznab Prowlarr/Jackett (opcional)</label><input type="text" id="torznabUrl" placeholder="https://..."></div>
+<div class="field"><label>API Key Prowlarr/Jackett (opcional)</label><input type="password" id="torznabKey"></div>
+<button type="submit" class="btn">Generar enlace de instalación</button>
+</form>
+<div id="result">
+<p><b>Tu enlace personalizado:</b> cópialo y pégalo en Nuvio/Stremio → Addons → Añadir por URL</p>
+<div id="manifestUrl"></div>
+<button class="copybtn" onclick="copiar()">📋 Copiar enlace</button>
+<div class="steps"><b>En Nuvio:</b> Addons → + → Pegar URL → Instalar<br><b>En Stremio:</b> Addons → Pegar en la barra de búsqueda → Install</div>
+</div>
+<script>
+document.getElementById('cfg').addEventListener('submit', function(e){
+  e.preventDefault();
+  const cfg = {};
+  const v = id => document.getElementById(id).value.trim();
+  const c = id => document.getElementById(id).checked;
+  if(v('torboxKey')) cfg.torboxKey = v('torboxKey');
+  cfg.instantOnly = c('instantOnly');
+  cfg.maxResults = v('maxResults');
+  cfg.srcTorrentio = c('srcTorrentio');
+  cfg.srcEztv = c('srcEztv');
+  cfg.srcGrantorrent = c('srcGrantorrent');
+  cfg.srcElitetorrent = c('srcElitetorrent');
+  cfg.srcMitorrent = c('srcMitorrent');
+  cfg.srcHacktorrent = c('srcHacktorrent');
+  if(v('extraSources')) cfg.extraSources = v('extraSources');
+  if(v('torznabUrl')) cfg.torznabUrl = v('torznabUrl');
+  if(v('torznabKey')) cfg.torznabKey = v('torznabKey');
+  const url = window.location.origin + '/' + encodeURIComponent(JSON.stringify(cfg)) + '/manifest.json';
+  document.getElementById('manifestUrl').textContent = url;
+  document.getElementById('result').style.display = 'block';
+  document.getElementById('result').scrollIntoView({behavior:'smooth'});
+});
+function copiar(){
+  const t = document.getElementById('manifestUrl').textContent;
+  navigator.clipboard.writeText(t).then(()=>alert('¡Enlace copiado! Pégalo en Nuvio/Stremio.'));
+}
+</script>
+</div></body></html>`);
 });
 
 // Landing sencilla
