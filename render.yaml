@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: latino-streams
+    env: node
+    buildCommand: npm install --production
+    startCommand: node index.js
+    plan: free

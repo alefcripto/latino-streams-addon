@@ -1,0 +1,715 @@
+/**
+ * Latino Streams — Stremio addon
+ *
+ * Busca las mejores fuentes en español latino (vía el agregador Torrentio)
+ * y las resuelve a reproducción instantánea usando la cuenta TorBox del usuario.
+ *
+ * Sin API key de TorBox funciona igual, devolviendo los torrents latino
+ * para que Stremio los reproduzca con su motor integrado.
+ */
+
+const { addonBuilder, getRouter } = require("stremio-addon-sdk");
+const express = require("express");
+const landingTemplate = require("stremio-addon-sdk/src/landingTemplate");
+const { XMLParser } = require("fast-xml-parser");
+
+const TORRENTIO_BASE = "https://torrentio.strem.fun";
+const TORBOX_API = "https://api.torbox.app/v1/api";
+const UA = "LatinoStreams/1.0 (+stremio-addon)";
+
+// ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
+const manifest = {
+	id: "com.latino-streams.torbox",
+	version: "1.0.0",
+	name: "Latino Streams ⚡",
+	description:
+		"Las mejores fuentes en español latino, reproducidas al instante con tu cuenta de TorBox.",
+	resources: ["stream"],
+	types: ["movie", "series"],
+	idPrefixes: ["tt"],
+	catalogs: [],
+	behaviorHints: {
+		configurable: true,
+		configurationRequired: false,
+	},
+	config: [
+		{
+			key: "torboxKey",
+			type: "password",
+			title: "TorBox API Key (recomendado para reproducción instantánea)",
+			required: false,
+		},
+		{
+			key: "instantOnly",
+			type: "checkbox",
+			title: "Solo mostrar fuentes instantáneas (ya cacheadas en TorBox)",
+			default: "checked",
+		},
+		{
+			key: "maxResults",
+			type: "select",
+			title: "Máximo de resultados por título",
+			options: ["4", "6", "8", "10", "12"],
+			default: "8",
+		},
+		{
+			key: "srcTorrentio",
+			type: "checkbox",
+			title: "Fuente: Torrentio (agregador principal)",
+			default: "checked",
+		},
+		{
+			key: "srcEztv",
+			type: "checkbox",
+			title: "Fuente: EZTV (respaldo para series)",
+			default: "checked",
+		},
+		{
+			key: "extraSources",
+			type: "text",
+			title: "Addons extra (URLs de manifest, una por línea) — ej. tu MediaFusion o Comet configurado",
+			required: false,
+		},
+		{
+			key: "torznabUrl",
+			type: "text",
+			title: "URL Torznab (Prowlarr/Jackett) — cientos de indexadores, incluyendo en español",
+			required: false,
+		},
+		{
+			key: "torznabKey",
+			type: "password",
+			title: "API Key de Prowlarr/Jackett",
+			required: false,
+		},
+	],
+};
+
+// ---------------------------------------------------------------------------
+// Mini caché en memoria con TTL
+// ---------------------------------------------------------------------------
+const _cache = new Map();
+function cacheGet(key) {
+	const e = _cache.get(key);
+	if (!e) return null;
+	if (Date.now() > e.exp) {
+		_cache.delete(key);
+		return null;
+	}
+	return e.val;
+}
+function cacheSet(key, val, ttlMs) {
+	if (_cache.size > 5000) _cache.delete(_cache.keys().next().value);
+	_cache.set(key, { val, exp: Date.now() + ttlMs });
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function shortHash(s) {
+	let h = 0;
+	const str = String(s || "");
+	for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+	return (h >>> 0).toString(36);
+}
+
+// ---------------------------------------------------------------------------
+// Detección de latino + parseo de calidad/seeders
+// ---------------------------------------------------------------------------
+const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|latinoam[eé]rica/i;
+const DUAL_RE = /\bdual\b/i;
+const SPAIN_RE = /castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish\s*\(spain\)/i;
+const SEEDERS_RE = /👤\s*([\d.,]+)/;
+const SIZE_RE = /💾\s*([\d.]+\s*[KMGT]B)/i;
+
+function parseQuality(text) {
+	if (/2160p|\b4k\b/i.test(text)) return { label: "2160p", score: 4 };
+	if (/1080p/i.test(text)) return { label: "1080p", score: 3 };
+	if (/720p/i.test(text)) return { label: "720p", score: 2 };
+	if (/480p/i.test(text)) return { label: "480p", score: 1 };
+	return { label: "SD", score: 0 };
+}
+
+function parseTorrentioStream(raw) {
+	if (!raw || !raw.infoHash) return null;
+	const filename = (raw.behaviorHints && raw.behaviorHints.filename) || "";
+	const text = `${raw.name || ""}\n${raw.title || ""}\n${filename}`;
+	const lower = text.toLowerCase();
+
+	// tier: 0 = latino confirmado, 1 = dual (probablemente latino), 2 = descartar
+	let tier = 2;
+	if (LATINO_RE.test(text)) tier = 0;
+	else if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) tier = 1;
+	else if (SPAIN_RE.test(text)) tier = 2;
+	if (tier === 2) return null;
+
+	const q = parseQuality(text);
+	const seedersM = text.match(SEEDERS_RE);
+	const sizeM = text.match(SIZE_RE);
+	const releaseName = (raw.title || "").split("\n")[0].slice(0, 120) || filename.slice(0, 120);
+
+	return {
+		infoHash: raw.infoHash.toLowerCase(),
+		tier,
+		quality: q.label,
+		qualityScore: q.score,
+		seeders: seedersM ? parseInt(seedersM[1].replace(/[.,]/g, ""), 10) || 0 : 0,
+		size: sizeM ? sizeM[1] : "?",
+		releaseName,
+		filename,
+		rawTitle: raw.title || "",
+	};
+}
+
+function rankStreams(a, b) {
+	return (
+		a.tier - b.tier ||
+		b.qualityScore - a.qualityScore ||
+		b.seeders - a.seeders
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Fuentes de streams (todo-en-uno con fallbacks)
+// Cada fuente devuelve streams en el formato común de parseTorrentioStream.
+// Si una fuente falla o tarda, las demás igual responden.
+// ---------------------------------------------------------------------------
+const SOURCE_TIMEOUT_MS = 12000;
+
+async function fetchWithTimeout(url, ms, options = {}) {
+	const ctrl = new AbortController();
+	const t = setTimeout(() => ctrl.abort(), ms);
+	try {
+		const res = await fetch(url, { ...options, signal: ctrl.signal });
+		return res;
+	} finally {
+		clearTimeout(t);
+	}
+}
+
+function formatBytes(b) {
+	const n = parseInt(b, 10);
+	if (!n) return "?";
+	if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
+	if (n >= 1e6) return (n / 1e6).toFixed(0) + " MB";
+	return Math.round(n / 1e3) + " KB";
+}
+
+// --- Fuente 1: Torrentio (agregador principal) ---
+async function fetchTorrentio(type, id) {
+	const cacheKey = `src:torrentio:${type}:${id}`;
+	const hit = cacheGet(cacheKey);
+	if (hit) return hit;
+
+	const url = `${TORRENTIO_BASE}/stream/${type}/${encodeURIComponent(id)}.json`;
+	const res = await fetchWithTimeout(url, SOURCE_TIMEOUT_MS, {
+		headers: { "User-Agent": UA },
+	});
+	if (!res.ok) throw new Error(`Torrentio respondió ${res.status}`);
+	const json = await res.json();
+
+	const parsed = (json.streams || [])
+		.map((s) => ({ ...parseTorrentioStream(s), source: "Torrentio" }))
+		.filter((s) => s && s.infoHash);
+	cacheSet(cacheKey, parsed, 60 * 60 * 1000);
+	return parsed;
+}
+
+// --- Fuente 2: EZTV (respaldo directo para series) ---
+async function fetchEZTV(type, id, season, episode) {
+	if (type !== "series" || season == null) return [];
+	const cacheKey = `src:eztv:${id}:${season}:${episode}`;
+	const hit = cacheGet(cacheKey);
+	if (hit) return hit;
+
+	const imdb = String(id).split(":")[0].replace(/^tt/, "");
+	const url = `https://eztv.re/api/get-torrents?imdb_id=${imdb}&limit=100`;
+	const res = await fetchWithTimeout(url, SOURCE_TIMEOUT_MS, {
+		headers: { "User-Agent": UA },
+		redirect: "follow",
+	});
+	if (!res.ok) throw new Error(`EZTV respondió ${res.status}`);
+	const json = await res.json();
+
+	const parsed = (json.torrents || [])
+		.filter(
+			(t) =>
+				parseInt(t.season, 10) === season &&
+				(episode == null || parseInt(t.episode, 10) === episode)
+		)
+		.map((t) => {
+			const text = `${t.filename || ""} ${t.title || ""}`;
+			const q = parseQuality(text);
+			const releaseName = (t.filename || t.title || "").slice(0, 120);
+			let tier = 2;
+			if (LATINO_RE.test(text)) tier = 0;
+			else if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) tier = 1;
+			if (tier === 2 || !t.hash) return null;
+			return {
+				infoHash: String(t.hash).toLowerCase(),
+				tier,
+				quality: q.label,
+				qualityScore: q.score,
+				seeders: parseInt(t.seeds, 10) || 0,
+				size: formatBytes(t.size_bytes),
+				releaseName,
+				filename: t.filename || "",
+				rawTitle: t.title || "",
+				source: "EZTV",
+			};
+		})
+		.filter(Boolean);
+	cacheSet(cacheKey, parsed, 60 * 60 * 1000);
+	return parsed;
+}
+
+// --- Fuente 3+: addons extra definidos por el usuario (ej. su MediaFusion/Comet) ---
+function parseExtraSourceUrls(raw) {
+	if (!raw) return [];
+	return String(raw)
+		.split(/[\n,;]+/)
+		.map((u) => u.trim().replace(/^stremio:\/\//, "https://"))
+		.filter((u) => /^https?:\/\//i.test(u))
+		.map((u) => u.replace(/\/manifest\.json\/?$/i, "").replace(/\/$/, ""))
+		.filter((u, i, arr) => arr.indexOf(u) === i)
+		.slice(0, 5); // máximo 5 para no demorar
+}
+
+async function fetchCustomSource(origin, type, id) {
+	const cacheKey = `src:custom:${origin}:${type}:${id}`;
+	const hit = cacheGet(cacheKey);
+	if (hit) return hit;
+
+	const url = `${origin}/stream/${type}/${encodeURIComponent(id)}.json`;
+	const res = await fetchWithTimeout(url, SOURCE_TIMEOUT_MS, {
+		headers: { "User-Agent": UA },
+	});
+	if (!res.ok) throw new Error(`Fuente extra respondió ${res.status}`);
+	const json = await res.json();
+	const label = origin.replace(/^https?:\/\//, "").split("/")[0];
+
+	const parsed = (json.streams || [])
+		.map((s) => ({ ...parseTorrentioStream(s), source: `Extra (${label})` }))
+		.filter((s) => s && s.infoHash);
+	cacheSet(cacheKey, parsed, 60 * 60 * 1000);
+	return parsed;
+}
+
+// --- Fuente 4: Torznab (Prowlarr/Jackett) — cientos de indexadores, incl. en español ---
+const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@" });
+
+function torznabAttrs(item) {
+	const attrs = {};
+	const raw = item["torznab:attr"];
+	if (!raw) return attrs;
+	for (const a of Array.isArray(raw) ? raw : [raw]) {
+		if (a && a["@name"]) attrs[a["@name"]] = a["@value"];
+	}
+	return attrs;
+}
+
+async function fetchTorznab(torznabUrl, torznabKey, type, id, season, episode) {
+	if (!torznabUrl) return [];
+	const cacheKey = `src:torznab:${type}:${id}`;
+	const hit = cacheGet(cacheKey);
+	if (hit) return hit;
+
+	const imdb = String(id).split(":")[0].replace(/^tt/, "");
+	const base = torznabUrl.replace(/\/$/, "");
+	const params =
+		type === "series"
+			? `t=tvsearch&imdbid=${imdb}${season != null ? `&season=${season}` : ""}${episode != null ? `&ep=${episode}` : ""}`
+			: `t=movie&imdbid=${imdb}`;
+	const url = `${base}?${params}&apikey=${encodeURIComponent(torznabKey || "")}`;
+
+	const res = await fetchWithTimeout(url, 20000, { headers: { "User-Agent": UA } });
+	if (!res.ok) throw new Error(`Torznab respondió ${res.status}`);
+	const xml = await res.text();
+	const doc = xmlParser.parse(xml);
+	const channel = (doc && doc.rss && doc.rss.channel) || {};
+	let items = channel.item || [];
+	if (!Array.isArray(items)) items = [items];
+
+	const parsed = items
+		.map((item) => {
+			if (!item) return null;
+			const attrs = torznabAttrs(item);
+			const title = String(item.title || "");
+			const enclosure = item.enclosure || {};
+			const encUrl = String(enclosure["@url"] || attrs.magneturl || "");
+			let infoHash = String(attrs.infohash || "").toLowerCase();
+			if (!infoHash) {
+				const m = encUrl.match(/btih:([a-f0-9]{40})/i);
+				if (m) infoHash = m[1].toLowerCase();
+			}
+			if (!infoHash) return null;
+
+			const q = parseQuality(title);
+			let tier = 2;
+			if (LATINO_RE.test(title)) tier = 0;
+			else if (DUAL_RE.test(title) && !SPAIN_RE.test(title)) tier = 1;
+			if (tier === 2) return null;
+
+			return {
+				infoHash,
+				tier,
+				quality: q.label,
+				qualityScore: q.score,
+				seeders: parseInt(attrs.seeders, 10) || 0,
+				size: formatBytes(attrs.size),
+				releaseName: title.slice(0, 120),
+				filename: "",
+				rawTitle: title,
+				source: "Torznab",
+			};
+		})
+		.filter(Boolean);
+	cacheSet(cacheKey, parsed, 60 * 60 * 1000);
+	return parsed;
+}
+
+// Orquesta todas las fuentes en paralelo, con fallback automático
+async function fetchAllSources(type, id, { season, episode, config }) {
+	const cacheKey = `all:${type}:${id}:${config.srcTorrentio ? 1 : 0}${config.srcEztv ? 1 : 0}:${shortHash(config.extraSources)}:${shortHash(config.torznabUrl)}`;
+	const hit = cacheGet(cacheKey);
+	if (hit) return hit;
+
+	const jobs = [];
+	if (config.srcTorrentio !== false) {
+		jobs.push(
+			fetchTorrentio(type, id).catch((e) => {
+				console.warn("Torrentio falló:", e.message);
+				return [];
+			})
+		);
+	}
+	if (config.srcEztv !== false) {
+		jobs.push(
+			fetchEZTV(type, id, season, episode).catch((e) => {
+				console.warn("EZTV falló:", e.message);
+				return [];
+			})
+		);
+	}
+	for (const origin of parseExtraSourceUrls(config.extraSources)) {
+		jobs.push(
+			fetchCustomSource(origin, type, id).catch((e) => {
+				console.warn(`Fuente extra ${origin} falló:`, e.message);
+				return [];
+			})
+		);
+	}
+	if (config.torznabUrl) {
+		jobs.push(
+			fetchTorznab(config.torznabUrl, config.torznabKey, type, id, season, episode).catch(
+				(e) => {
+					console.warn("Torznab falló:", e.message);
+					return [];
+				}
+			)
+		);
+	}
+
+	const results = await Promise.all(jobs);
+
+	// Unir + deduplicar por infoHash (gana la primera fuente que lo trajo)
+	const seen = new Set();
+	const merged = [];
+	for (const list of results) {
+		for (const s of list) {
+			if (!s || seen.has(s.infoHash)) continue;
+			seen.add(s.infoHash);
+			merged.push(s);
+		}
+	}
+
+	// Filtrar solo latino y ordenar
+	const latino = merged.filter((s) => s.tier < 2).sort(rankStreams);
+	cacheSet(cacheKey, latino, 30 * 60 * 1000);
+	return latino;
+}
+
+// ---------------------------------------------------------------------------
+// TorBox
+// ---------------------------------------------------------------------------
+async function torboxCall(key, path, { method = "GET", body = null, form = null } = {}) {
+	const headers = { Authorization: `Bearer ${key}`, "User-Agent": UA };
+	let payload = null;
+	if (form) {
+		payload = form; // FormData: fetch pone el content-type solo
+	} else if (body) {
+		headers["Content-Type"] = "application/json";
+		payload = JSON.stringify(body);
+	}
+	const res = await fetch(TORBOX_API + path, { method, headers, body: payload });
+	const json = await res.json().catch(() => ({}));
+	if (!res.ok || json.success === false) {
+		const err = new Error(json.error || json.detail || `TorBox HTTP ${res.status}`);
+		err.status = res.status;
+		throw err;
+	}
+	return json.data;
+}
+
+async function verifyTorboxKey(key) {
+	const cacheKey = `tbkey:${key.slice(0, 12)}`;
+	const hit = cacheGet(cacheKey);
+	if (hit !== null) return hit;
+	try {
+		await torboxCall(key, "/user/me");
+		cacheSet(cacheKey, true, 60 * 60 * 1000);
+		return true;
+	} catch (e) {
+		console.warn("TorBox key inválida:", e.message);
+		cacheSet(cacheKey, false, 10 * 60 * 1000);
+		return false;
+	}
+}
+
+async function checkCached(key, hashes) {
+	const uniq = [...new Set(hashes)].slice(0, 100);
+	if (!uniq.length) return {};
+	const cacheKey = `cached:${shortHash(uniq.sort().join(","))}`;
+	const hit = cacheGet(cacheKey);
+	if (hit) return hit;
+
+	// GET con query params (equivalente documentado a instantAvailability)
+	const qs = new URLSearchParams({
+		hash: uniq.join(","),
+		format: "object",
+		list_files: "false",
+	});
+	const data = await torboxCall(key, `/torrents/checkcached?${qs.toString()}`);
+
+	const out = {};
+	for (const h of uniq) {
+		const v = data && (data[h] || data[h.toLowerCase()]);
+		out[h] = !!(v && v !== false);
+	}
+	cacheSet(cacheKey, out, 30 * 60 * 1000);
+	return out;
+}
+
+const VIDEO_EXT = /\.(mkv|mp4|avi|m4v|ts|mov|wmv|webm|m2ts)$/i;
+function pickFile(files, { isSeries, season, episode, hintFilename }) {
+	if (!files || !files.length) return null;
+	const videos = files.filter(
+		(f) => VIDEO_EXT.test(f.name || "") && !/sample/i.test(f.name || "")
+	);
+	const pool = videos.length ? videos : files;
+
+	if (hintFilename) {
+		const m = pool.find(
+			(f) => f.name === hintFilename || (f.name || "").endsWith("/" + hintFilename)
+		);
+		if (m) return m;
+	}
+	if (isSeries && season != null && episode != null) {
+		const patterns = [
+			new RegExp(`s0*${season}e0*${episode}(?![0-9])`, "i"),
+			new RegExp(`[^0-9]${season}x0*${episode}(?![0-9])`, "i"),
+		];
+		for (const p of patterns) {
+			const m = pool.find((f) => p.test(f.name || ""));
+			if (m) return m;
+		}
+	}
+	return [...pool].sort((a, b) => (b.size || 0) - (a.size || 0))[0];
+}
+
+async function resolveViaTorbox(key, stream, { isSeries, season, episode }) {
+	const cacheKey = `resolved:${stream.infoHash}:${isSeries ? `${season}x${episode}` : "movie"}`;
+	const hit = cacheGet(cacheKey);
+	if (hit) return hit;
+
+	// 1. agregar el magnet a TorBox (si ya está cacheado es casi instantáneo)
+	const form = new FormData();
+	form.append("magnet", `magnet:?xt=urn:btih:${stream.infoHash}`);
+	let created;
+	try {
+		created = await torboxCall(key, "/torrents/createtorrent", { method: "POST", form });
+	} catch (e) {
+		console.warn("createtorrent falló:", e.message);
+		return null;
+	}
+	const torrentId = created && created.torrent_id;
+	if (!torrentId) return null;
+
+	// 2. obtener la lista de archivos
+	let files = [];
+	try {
+		const list = await torboxCall(key, `/torrents/mylist?id=${torrentId}`);
+		const arr = Array.isArray(list) ? list : [list];
+		const entry =
+			arr.find((t) => String(t.id) === String(torrentId)) || arr[0];
+		files = (entry && entry.files) || [];
+	} catch (e) {
+		console.warn("mylist falló:", e.message);
+		return null;
+	}
+
+	const file = pickFile(files, {
+		isSeries,
+		season,
+		episode,
+		hintFilename: stream.filename,
+	});
+	if (!file || file.id == null) return null;
+
+	// 3. generar el link de descarga (con reintentos por si aún indexa)
+	let dlUrl = null;
+	for (let attempt = 0; attempt < 3 && !dlUrl; attempt++) {
+		try {
+			const data = await torboxCall(
+				key,
+				`/torrents/requestdl?token=${encodeURIComponent(key)}&torrent_id=${torrentId}&file_id=${file.id}`
+			);
+			if (typeof data === "string" && data.startsWith("http")) dlUrl = data;
+		} catch (e) {
+			await sleep(2000);
+		}
+	}
+	if (dlUrl) cacheSet(cacheKey, dlUrl, 6 * 60 * 60 * 1000); // 6h: requestdl tiene presupuesto limitado
+	return dlUrl;
+}
+
+// paralelismo limitado
+async function mapLimit(items, limit, fn) {
+	const results = new Array(items.length);
+	let i = 0;
+	async function worker() {
+		while (i < items.length) {
+			const idx = i++;
+			try {
+				results[idx] = await fn(items[idx], idx);
+			} catch (e) {
+				results[idx] = null;
+			}
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+	return results;
+}
+
+// ---------------------------------------------------------------------------
+// Addon
+// ---------------------------------------------------------------------------
+const builder = new addonBuilder(manifest);
+
+builder.defineStreamHandler(async ({ type, id, config }) => {
+	try {
+		const { torboxKey = "", instantOnly = true, maxResults = "8" } = config || {};
+		const max = Math.min(Math.max(parseInt(maxResults, 10) || 8, 1), 12);
+
+		const parts = String(id).split(":");
+		const season = parts[1] ? parseInt(parts[1], 10) : null;
+		const episode = parts[2] ? parseInt(parts[2], 10) : null;
+		const isSeries = type === "series";
+
+		// 1. Fuentes latino desde todas las fuentes (todo-en-uno con fallbacks)
+		const latino = await fetchAllSources(type, id, {
+			season,
+			episode,
+			config: {
+				srcTorrentio: config.srcTorrentio !== false,
+				srcEztv: config.srcEztv !== false,
+				extraSources: config.extraSources || "",
+				torznabUrl: (config.torznabUrl || "").trim(),
+				torznabKey: config.torznabKey || "",
+			},
+		});
+		if (!latino.length) return { streams: [] };
+
+		const torboxOk = torboxKey && (await verifyTorboxKey(torboxKey));
+
+		// 2. Resolver con TorBox
+		if (torboxOk) {
+			const cached = await checkCached(
+				torboxKey,
+				latino.slice(0, 60).map((s) => s.infoHash)
+			);
+			const cachedOnes = latino.filter((s) => cached[s.infoHash]);
+			const uncachedOnes = latino.filter((s) => !cached[s.infoHash]);
+			const pool = instantOnly ? cachedOnes : [...cachedOnes, ...uncachedOnes];
+
+			const resolved = await mapLimit(pool.slice(0, max), 4, async (s) => {
+				if (!cached[s.infoHash]) {
+					// sin caché: devolver el magnet para el motor de Stremio
+					return {
+						infoHash: s.infoHash,
+						name: `Latino ${s.quality} 🧲`,
+						title: `${s.releaseName}\n🇲🇽 LATINO • ${s.quality} • 💾 ${s.size} • 👤 ${s.seeders} • ⚙️ ${s.source}\n🧲 Torrent directo (no está en caché de TorBox)`,
+						behaviorHints: { bingeGroup: `latino|magnet|${s.quality}` },
+					};
+				}
+				const url = await resolveViaTorbox(torboxKey, s, { isSeries, season, episode });
+				if (!url) return null;
+				return {
+					url,
+					name: `Latino ${s.quality} ⚡`,
+					title: `${s.releaseName}\n🇲🇽 LATINO • ${s.quality} • 💾 ${s.size} • 👤 ${s.seeders} • ⚙️ ${s.source}\n⚡ Reproducción instantánea vía TorBox`,
+					behaviorHints: { bingeGroup: `latino|torbox|${s.quality}` },
+				};
+			});
+
+			const ok = resolved.filter(Boolean);
+			if (ok.length) return { streams: ok };
+			// si TorBox falló en todo, caemos al modo magnet
+		}
+
+		// 3. Fallback: magnets latino directos (Stremio los reproduce nativamente)
+		return {
+			streams: latino.slice(0, max).map((s) => ({
+				infoHash: s.infoHash,
+				name: `Latino ${s.quality} 🧲`,
+				title: `${s.releaseName}\n🇲🇽 LATINO • ${s.quality} • 💾 ${s.size} • 👤 ${s.seeders} • ⚙️ ${s.source}\n🧲 Torrent directo${torboxKey ? "" : " — agrega tu TorBox API Key en la configuración para reproducción instantánea"}`,
+				behaviorHints: { bingeGroup: `latino|magnet|${s.quality}` },
+			})),
+		};
+	} catch (err) {
+		console.error("stream handler error:", err.message);
+		return { streams: [] };
+	}
+});
+
+const addonInterface = builder.getInterface();
+
+// ---------------------------------------------------------------------------
+// Servidor HTTP
+// ---------------------------------------------------------------------------
+const app = express();
+
+// Página de configuración auto-generada (formulario con la API key de TorBox)
+app.get("/configure", (req, res) => {
+	res.setHeader("content-type", "text/html; charset=utf-8");
+	res.end(landingTemplate(manifest));
+});
+
+// Landing sencilla
+app.get("/", (req, res) => {
+	res.setHeader("content-type", "text/html; charset=utf-8");
+	res.end(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Latino Streams ⚡ — Stremio Addon</title>
+<style>body{font-family:system-ui,sans-serif;background:#0f1420;color:#e8ecf4;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:560px;padding:32px;background:#182030;border-radius:16px;box-shadow:0 8px 40px rgba(0,0,0,.4)}
+h1{margin:0 0 8px}.btn{display:inline-block;margin-top:16px;padding:12px 24px;background:#6c5ce7;color:#fff;border-radius:10px;text-decoration:none;font-weight:600}
+code{background:#0b0f18;padding:2px 6px;border-radius:6px}</style></head>
+<body><div class="card">
+<h1>Latino Streams ⚡</h1>
+<p>Addon de Stremio que encuentra las <b>mejores fuentes en español latino</b> y las reproduce al instante con tu cuenta de <b>TorBox</b>.</p>
+<ol>
+<li>Consigue tu API key en <code>torbox.app → Settings → API</code>.</li>
+<li>Pulsa <b>Configurar</b>, pega tu key y guarda.</li>
+<li>Instala el addon en Stremio y disfruta 🇲🇽.</li>
+</ol>
+<a class="btn" href="/configure">Configurar</a>
+</div></body></html>`);
+});
+
+// Rutas del protocolo Stremio (manifest, stream) — con soporte de config en la URL
+app.use(getRouter(builder.getInterface()));
+
+const PORT = process.env.PORT || 7000;
+app.listen(PORT, () => {
+	console.log(`Latino Streams escuchando en http://127.0.0.1:${PORT}/manifest.json`);
+});
