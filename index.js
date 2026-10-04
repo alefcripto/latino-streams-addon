@@ -12,6 +12,9 @@ const { addonBuilder, getRouter } = require("stremio-addon-sdk");
 const express = require("express");
 const landingTemplate = require("stremio-addon-sdk/src/landingTemplate");
 const { XMLParser } = require("fast-xml-parser");
+const cheerio = require("cheerio");
+const crypto = require("crypto");
+const { fetchAlfaTorrentSource } = require("./alfa-torrents.js");
 
 const TORRENTIO_BASE = "https://torrentio.strem.fun";
 const TORBOX_API = "https://api.torbox.app/v1/api";
@@ -64,6 +67,30 @@ const manifest = {
 			key: "srcEztv",
 			type: "checkbox",
 			title: "Fuente: EZTV (respaldo para series)",
+			default: "checked",
+		},
+		{
+			key: "srcGrantorrent",
+			type: "checkbox",
+			title: "Fuente: GranTorrent (torrents latino — pelis y series)",
+			default: "checked",
+		},
+		{
+			key: "srcElitetorrent",
+			type: "checkbox",
+			title: "Fuente: EliteTorrent (torrents latino — pelis y series)",
+			default: "checked",
+		},
+		{
+			key: "srcMitorrent",
+			type: "checkbox",
+			title: "Fuente: MiTorrent (torrents latino — pelis y series)",
+			default: "checked",
+		},
+		{
+			key: "srcHacktorrent",
+			type: "checkbox",
+			title: "Fuente: HackTorrent (torrents latino — pelis y series)",
 			default: "checked",
 		},
 		{
@@ -263,6 +290,276 @@ async function fetchEZTV(type, id, season, episode) {
 	return parsed;
 }
 
+// --- Fuente: GranTorrent (torrents latino — pelis y series; scrapers estilo Alfa/Kodi) ---
+const GT_MIRRORS = ["https://grantorrent.zip", "https://grantorrent.foo", "https://grantorrent.net"];
+const GT_TIMEOUT_MS = 9000;
+
+// Resuelve el título vía Cinemeta (GranTorrent busca por texto, no por IMDb ID)
+async function fetchTitle(type, id) {
+	const imdb = String(id).split(":")[0];
+	const cacheKey = `title:${type}:${imdb}`;
+	const hit = cacheGet(cacheKey);
+	if (hit) return hit;
+	try {
+		const res = await fetchWithTimeout(`https://v3-cinemeta.strem.io/meta/${type}/${imdb}.json`, 8000, {
+			headers: { "User-Agent": UA },
+		});
+		if (!res.ok) return null;
+		const json = await res.json();
+		const name = json && json.meta && json.meta.name ? String(json.meta.name) : null;
+		if (name) cacheSet(cacheKey, name, 24 * 3600 * 1000);
+		return name;
+	} catch {
+		return null;
+	}
+}
+
+// Parser bencode mínimo: extrae el dict "info" con su rango exacto de bytes
+function bdecodeRaw(buf, pos) {
+	const c = buf[pos];
+	if (c === 0x69) {
+		// entero: i<num>e
+		const e = buf.indexOf(0x65, pos);
+		if (e < 0) throw new Error("bencode inválido");
+		return { value: parseInt(buf.toString("ascii", pos + 1, e), 10), next: e + 1, start: pos, end: e + 1 };
+	}
+	if (c === 0x6c || c === 0x64) {
+		// lista / diccionario
+		const isDict = c === 0x64;
+		let p = pos + 1;
+		const out = isDict ? {} : [];
+		let infoRange = null;
+		while (p < buf.length && buf[p] !== 0x65) {
+			const k = bdecodeRaw(buf, p);
+			p = k.next;
+			const v = bdecodeRaw(buf, p);
+			p = v.next;
+			if (isDict) {
+				const ks = k.value.toString("utf8");
+				out[ks] = v.value;
+				if (ks === "info") infoRange = [v.start, v.end];
+			} else {
+				out.push(v.value);
+			}
+		}
+		const r = { value: out, next: p + 1, start: pos, end: p + 1 };
+		if (infoRange) r.infoRange = infoRange;
+		return r;
+	}
+	// string: <len>:<bytes>
+	const colon = buf.indexOf(0x3a, pos);
+	if (colon < 0) throw new Error("bencode inválido");
+	const len = parseInt(buf.toString("ascii", pos, colon), 10);
+	if (!Number.isFinite(len) || len < 0 || pos + len > buf.length) throw new Error("bencode inválido");
+	const s = colon + 1;
+	return { value: buf.slice(s, s + len), next: s + len, start: pos, end: s + len };
+}
+
+function infoHashFromTorrent(buf) {
+	if (!buf || buf.length < 50 || buf[0] !== 0x64) return null;
+	try {
+		const root = bdecodeRaw(buf, 0);
+		if (!root || !root.infoRange) return null;
+		const [s, e] = root.infoRange;
+		return crypto.createHash("sha1").update(buf.slice(s, e)).digest("hex");
+	} catch {
+		return null;
+	}
+}
+
+function magnetInfoHash(magnet) {
+	const m = /btih:([a-zA-Z0-9]+)/i.exec(magnet || "");
+	if (!m) return null;
+	const h = m[1];
+	if (/^[a-fA-F0-9]{40}$/.test(h)) return h.toLowerCase();
+	if (/^[a-zA-Z2-7]{32}$/.test(h)) {
+		const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+		let bits = "";
+		for (const ch of h.toUpperCase()) {
+			const v = alphabet.indexOf(ch);
+			if (v < 0) return null;
+			bits += v.toString(2).padStart(5, "0");
+		}
+		let hex = "";
+		for (let i = 0; i + 8 <= bits.length; i += 8) {
+			hex += parseInt(bits.slice(i, i + 8), 2).toString(16).padStart(2, "0");
+		}
+		if (hex.length === 40) return hex;
+	}
+	return null;
+}
+
+function normTitle(s) {
+	return String(s || "")
+		.toLowerCase()
+		.normalize("NFD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.replace(/[^a-z0-9]+/g, " ")
+		.trim();
+}
+
+async function fetchGranTorrent(type, id, season, episode) {
+	const cacheKey = `src:grantorrent:${type}:${id}`;
+	const hit = cacheGet(cacheKey);
+	if (hit) return hit;
+	try {
+		const title = await fetchTitle(type, id);
+		if (!title) return [];
+		const section = type === "series" ? "series_p" : "peliculas";
+		const q = encodeURIComponent(title);
+
+		// 1. Buscar en los espejos (fallback automático)
+		let html = null;
+		let mirrorHost = null;
+		for (const m of GT_MIRRORS) {
+			try {
+				const res = await fetchWithTimeout(`${m}/${section}/?query=${q}`, GT_TIMEOUT_MS, {
+					headers: { "User-Agent": UA },
+				});
+				if (res.ok) {
+					html = await res.text();
+					mirrorHost = new URL(m).hostname;
+					break;
+				}
+			} catch {
+				// probar siguiente espejo
+			}
+		}
+		if (!html) return [];
+
+		// 2. Tarjetas de resultados (estructura documentada por el canal Alfa)
+		const $ = cheerio.load(html);
+		const cards = [];
+		$("div.movie-list div.relative").each((_, el) => {
+			const a = $(el).find("a").first();
+			const href = a.attr("href");
+			const name = $(el).find("p").first().text().trim();
+			if (href && name) cards.push({ url: new URL(href, `https://${mirrorHost}`).href, name });
+		});
+
+		const nt = normTitle(title);
+		const matched = cards
+			.filter((c) => {
+				const nn = normTitle(c.name);
+				if (!nn.includes(nt) && !nt.includes(nn)) return false;
+				if (type === "series" && season != null) {
+					const sm = /temporada\s+(\d+)/i.exec(c.name);
+					if (sm && parseInt(sm[1], 10) !== season) return false;
+				}
+				return true;
+			})
+			.slice(0, 3);
+		if (!matched.length) {
+			cacheSet(cacheKey, [], 30 * 60 * 1000);
+			return [];
+		}
+
+		// 3. Páginas de detalle → filas con enlaces torrent
+		const detailPages = (
+			await Promise.all(
+				matched.map(async (c) => {
+					try {
+						const res = await fetchWithTimeout(c.url, GT_TIMEOUT_MS, {
+							headers: { "User-Agent": UA },
+						});
+						if (!res.ok) return null;
+						return { card: c, html: await res.text() };
+					} catch {
+						return null;
+					}
+				})
+			)
+		).filter(Boolean);
+
+		const rows = [];
+		for (const d of detailPages) {
+			const $$ = cheerio.load(d.html);
+			$$("tr").each((_, tr) => {
+				const link = $$(tr).find("a.linktorrent").first();
+				if (!link.length) return;
+				const dataSrc = link.attr("data-src") || "";
+				let torrentUrl = null;
+				if (dataSrc) {
+					try {
+						torrentUrl = Buffer.from(dataSrc, "base64").toString("utf8").trim();
+					} catch {
+						// ignorar
+					}
+				}
+				const href = link.attr("href") || "";
+				const magnet = href.startsWith("magnet:") ? href : null;
+				if (!torrentUrl && !magnet) return;
+				const flagImg = $$(tr).find("td img").first();
+				const flag = `${flagImg.attr("alt") || ""} ${flagImg.attr("title") || ""} ${flagImg.attr("src") || ""}`;
+				const rowText = $$(tr).text().replace(/\s+/g, " ").trim();
+				// Para series: solo filas de la temporada pedida (packs "Temporada N Completa" valen)
+				if (type === "series" && season != null) {
+					const sm = /temporada\s+(\d+)/i.exec(`${d.card.name} ${rowText}`);
+					if (sm && parseInt(sm[1], 10) !== season) return;
+				}
+				rows.push({ torrentUrl, magnet, flag, rowText, cardName: d.card.name });
+			});
+		}
+
+		// 4. Resolver infoHash de cada fila (magnet directo o descarga del .torrent)
+		const streams = [];
+		await Promise.all(
+			rows.slice(0, 8).map(async (r) => {
+				let infoHash = r.magnet ? magnetInfoHash(r.magnet) : null;
+				if (!infoHash && r.torrentUrl) {
+					const candidates = [r.torrentUrl];
+					try {
+						const u = new URL(r.torrentUrl);
+						// reescribir al host de torrents del espejo activo (estilo Alfa: files.{espejo})
+						candidates.push(`https://files.${mirrorHost}${u.pathname}`);
+					} catch {
+						// ignorar
+					}
+					for (const cand of candidates) {
+						try {
+							const res = await fetchWithTimeout(cand, GT_TIMEOUT_MS, {
+								headers: { "User-Agent": UA },
+							});
+							if (!res.ok) continue;
+							const buf = Buffer.from(await res.arrayBuffer());
+							infoHash = infoHashFromTorrent(buf);
+							if (infoHash) break;
+						} catch {
+							// siguiente candidato
+						}
+					}
+				}
+				if (!infoHash) return;
+				const text = `${r.cardName}\n${r.rowText}\n${r.flag}`;
+				let tier = 2;
+				if (LATINO_RE.test(text)) tier = 0;
+				else if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) tier = 1;
+				if (tier === 2) return;
+				const ql = parseQuality(text);
+				streams.push({
+					infoHash: infoHash.toLowerCase(),
+					tier,
+					quality: ql.label,
+					qualityScore: ql.score,
+					seeders: 0,
+					size: "?",
+					releaseName: `${r.cardName} — ${r.rowText}`.slice(0, 120),
+					filename: "",
+					rawTitle: text,
+					source: "GranTorrent",
+				});
+			})
+		);
+
+		streams.sort(rankStreams);
+		cacheSet(cacheKey, streams, 30 * 60 * 1000);
+		return streams;
+	} catch (e) {
+		console.warn("GranTorrent falló:", e.message);
+		return [];
+	}
+}
+
 // --- Fuente 3+: addons extra definidos por el usuario (ej. su MediaFusion/Comet) ---
 function parseExtraSourceUrls(raw) {
 	if (!raw) return [];
@@ -370,7 +667,7 @@ async function fetchTorznab(torznabUrl, torznabKey, type, id, season, episode) {
 
 // Orquesta todas las fuentes en paralelo, con fallback automático
 async function fetchAllSources(type, id, { season, episode, config }) {
-	const cacheKey = `all:${type}:${id}:${config.srcTorrentio ? 1 : 0}${config.srcEztv ? 1 : 0}:${shortHash(config.extraSources)}:${shortHash(config.torznabUrl)}`;
+	const cacheKey = `all:${type}:${id}:${config.srcTorrentio ? 1 : 0}${config.srcEztv ? 1 : 0}${config.srcGrantorrent ? 1 : 0}${config.srcElitetorrent ? 1 : 0}${config.srcMitorrent ? 1 : 0}${config.srcHacktorrent ? 1 : 0}:${shortHash(config.extraSources)}:${shortHash(config.torznabUrl)}`;
 	const hit = cacheGet(cacheKey);
 	if (hit) return hit;
 
@@ -390,6 +687,28 @@ async function fetchAllSources(type, id, { season, episode, config }) {
 				return [];
 			})
 		);
+	}
+	if (config.srcGrantorrent !== false) {
+		jobs.push(
+			fetchGranTorrent(type, id, season, episode).catch((e) => {
+				console.warn("GranTorrent falló:", e.message);
+				return [];
+			})
+		);
+	}
+	for (const [cfgKey, srcId] of [
+		["srcElitetorrent", "elitetorrent"],
+		["srcMitorrent", "mitorrent"],
+		["srcHacktorrent", "hacktorrent"],
+	]) {
+		if (config[cfgKey] !== false) {
+			jobs.push(
+				fetchAlfaTorrentSource(srcId, type, id, season, episode).catch((e) => {
+					console.warn(`${srcId} falló:`, e.message);
+					return [];
+				})
+			);
+		}
 	}
 	for (const origin of parseExtraSourceUrls(config.extraSources)) {
 		jobs.push(
@@ -613,6 +932,10 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 			config: {
 				srcTorrentio: config.srcTorrentio !== false,
 				srcEztv: config.srcEztv !== false,
+				srcGrantorrent: config.srcGrantorrent !== false,
+				srcElitetorrent: config.srcElitetorrent !== false,
+				srcMitorrent: config.srcMitorrent !== false,
+				srcHacktorrent: config.srcHacktorrent !== false,
 				extraSources: config.extraSources || "",
 				torznabUrl: (config.torznabUrl || "").trim(),
 				torznabKey: config.torznabKey || "",
