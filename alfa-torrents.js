@@ -19,7 +19,7 @@ const cheerio = require("cheerio");
 const crypto = require("crypto");
 
 const UA = "LatinoStreams/1.0 (+stremio-addon)";
-const AT_TIMEOUT_MS = 10000;
+const AT_TIMEOUT_MS = 6000;
 
 // --- Mini caché local ---
 const _cache = new Map();

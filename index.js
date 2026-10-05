@@ -15,10 +15,19 @@ const { XMLParser } = require("fast-xml-parser");
 const cheerio = require("cheerio");
 const crypto = require("crypto");
 const { fetchAlfaTorrentSource } = require("./alfa-torrents.js");
+const { fetchAllHttpSources } = require("./alfa-http.js");
 
 const TORRENTIO_BASE = "https://torrentio.strem.fun";
 const TORBOX_API = "https://api.torbox.app/v1/api";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// Fuentes HTTP habilitadas (se agregan conforme se implementan adaptadores en alfa-http.js)
+// TODO: Actualizar según resultados de auditoría
+const HTTP_SOURCES_ENABLED = [
+	// "sololatino",
+	// "cuevana2espanol",
+	// "pelisplus",
+];
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -60,14 +69,14 @@ const manifest = {
 		{
 			key: "srcTorrentio",
 			type: "checkbox",
-			title: "Fuente: Torrentio (agregador principal)",
-			default: "checked",
+			title: "Fuente: Torrentio (⚠️ bloqueado desde el servidor, usar solo si funciona)",
+			default: "unchecked",
 		},
 		{
 			key: "srcEztv",
 			type: "checkbox",
-			title: "Fuente: EZTV (respaldo para series)",
-			default: "checked",
+			title: "Fuente: EZTV (⚠️ bloqueado desde el servidor)",
+			default: "unchecked",
 		},
 		{
 			key: "srcGrantorrent",
@@ -209,7 +218,7 @@ function rankStreams(a, b) {
 // Cada fuente devuelve streams en el formato común de parseTorrentioStream.
 // Si una fuente falla o tarda, las demás igual responden.
 // ---------------------------------------------------------------------------
-const SOURCE_TIMEOUT_MS = 12000;
+const SOURCE_TIMEOUT_MS = 6000;
 
 async function fetchWithTimeout(url, ms, options = {}) {
 	const ctrl = new AbortController();
@@ -300,7 +309,7 @@ async function fetchEZTV(type, id, season, episode) {
 
 // --- Fuente: GranTorrent (torrents latino — pelis y series; scrapers estilo Alfa/Kodi) ---
 const GT_MIRRORS = ["https://grantorrent.zip", "https://grantorrent.foo", "https://grantorrent.net"];
-const GT_TIMEOUT_MS = 9000;
+const GT_TIMEOUT_MS = 6000;
 
 // Resuelve el título vía Cinemeta (GranTorrent busca por texto, no por IMDb ID)
 async function fetchTitle(type, id) {
@@ -934,22 +943,37 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 		const isSeries = type === "series";
 
 		// 1. Fuentes latino desde todas las fuentes (todo-en-uno con fallbacks)
-		const latino = await fetchAllSources(type, id, {
-			season,
-			episode,
-			config: {
-				srcTorrentio: config.srcTorrentio !== false,
-				srcEztv: config.srcEztv !== false,
-				srcGrantorrent: config.srcGrantorrent !== false,
-				srcElitetorrent: config.srcElitetorrent !== false,
-				srcMitorrent: config.srcMitorrent !== false,
-				srcHacktorrent: config.srcHacktorrent !== false,
-				extraSources: config.extraSources || "",
-				torznabUrl: (config.torznabUrl || "").trim(),
-				torznabKey: config.torznabKey || "",
-			},
-		});
-		if (!latino.length) return { streams: [] };
+		// Torrents y HTTP en paralelo para máxima velocidad
+		const [latino, httpStreams] = await Promise.all([
+			fetchAllSources(type, id, {
+				season,
+				episode,
+				config: {
+					srcTorrentio: config.srcTorrentio !== false,
+					srcEztv: config.srcEztv !== false,
+					srcGrantorrent: config.srcGrantorrent !== false,
+					srcElitetorrent: config.srcElitetorrent !== false,
+					srcMitorrent: config.srcMitorrent !== false,
+					srcHacktorrent: config.srcHacktorrent !== false,
+					extraSources: config.extraSources || "",
+					torznabUrl: (config.torznabUrl || "").trim(),
+					torznabKey: config.torznabKey || "",
+				},
+			}),
+			HTTP_SOURCES_ENABLED.length
+				? fetchAllHttpSources(type, id, season, episode, HTTP_SOURCES_ENABLED).catch(() => [])
+				: Promise.resolve([]),
+		]);
+
+		// Convertir streams HTTP a formato Stremio (van directo, sin TorBox)
+		const httpFormatted = (httpStreams || []).map((s) => ({
+			url: s.url,
+			name: `Latino ${s.quality} 🌐`,
+			title: `${s.source}\n🇲🇽 LATINO • ${s.quality}${s.server ? ` • ⚙️ ${s.server}` : ""}\n🌐 Streaming directo`,
+			behaviorHints: { bingeGroup: `latino|http|${s.quality}` },
+		}));
+
+		if (!latino.length && !httpFormatted.length) return { streams: [] };
 
 		const torboxOk = torboxKey && (await verifyTorboxKey(torboxKey));
 
@@ -984,18 +1008,22 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 			});
 
 			const ok = resolved.filter(Boolean);
-			if (ok.length) return { streams: ok };
+			// Combinar con streams HTTP directos (siempre disponibles, sin TorBox)
+			const combined = [...httpFormatted.slice(0, max), ...ok];
+			if (combined.length) return { streams: combined.slice(0, max) };
 			// si TorBox falló en todo, caemos al modo magnet
 		}
 
 		// 3. Fallback: magnets latino directos (Stremio los reproduce nativamente)
+		// + streams HTTP directos al inicio (no requieren torrent)
+		const magnets = latino.slice(0, max).map((s) => ({
+			infoHash: s.infoHash,
+			name: `Latino ${s.quality} 🧲`,
+			title: `${s.releaseName}\n🇲🇽 LATINO • ${s.quality} • 💾 ${s.size} • 👤 ${s.seeders} • ⚙️ ${s.source}\n🧲 Torrent directo${torboxKey ? "" : " — agrega tu TorBox API Key en la configuración para reproducción instantánea"}`,
+			behaviorHints: { bingeGroup: `latino|magnet|${s.quality}` },
+		}));
 		return {
-			streams: latino.slice(0, max).map((s) => ({
-				infoHash: s.infoHash,
-				name: `Latino ${s.quality} 🧲`,
-				title: `${s.releaseName}\n🇲🇽 LATINO • ${s.quality} • 💾 ${s.size} • 👤 ${s.seeders} • ⚙️ ${s.source}\n🧲 Torrent directo${torboxKey ? "" : " — agrega tu TorBox API Key en la configuración para reproducción instantánea"}`,
-				behaviorHints: { bingeGroup: `latino|magnet|${s.quality}` },
-			})),
+			streams: [...httpFormatted.slice(0, max), ...magnets].slice(0, max),
 		};
 	} catch (err) {
 		console.error("stream handler error:", err.message);
@@ -1039,8 +1067,8 @@ h1{margin:0 0 4px;font-size:1.5em}p.sub{color:#9aa4b8;margin:0 0 20px;font-size:
 <div class="field"><label>TorBox API Key (recomendado)</label><input type="password" id="torboxKey" placeholder="Pégala aquí (torbox.app → Settings → API)"></div>
 <div class="check"><input type="checkbox" id="instantOnly" checked><span>Solo fuentes instantáneas (ya en caché de TorBox)</span></div>
 <div class="field"><label>Máximo de resultados</label><select id="maxResults"><option>4</option><option>6</option><option selected>8</option><option>10</option><option>12</option></select></div>
-<div class="check"><input type="checkbox" id="srcTorrentio" checked><span>Torrentio (agregador principal)</span></div>
-<div class="check"><input type="checkbox" id="srcEztv" checked><span>EZTV (respaldo series)</span></div>
+<div class="check"><input type="checkbox" id="srcTorrentio"><span>Torrentio (⚠️ bloqueado desde servidor)</span></div>
+<div class="check"><input type="checkbox" id="srcEztv"><span>EZTV (⚠️ bloqueado desde servidor)</span></div>
 <div class="check"><input type="checkbox" id="srcGrantorrent" checked><span>GranTorrent (latino)</span></div>
 <div class="check"><input type="checkbox" id="srcElitetorrent" checked><span>EliteTorrent (latino)</span></div>
 <div class="check"><input type="checkbox" id="srcMitorrent" checked><span>MiTorrent (latino)</span></div>
