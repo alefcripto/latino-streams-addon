@@ -8,21 +8,22 @@
 // Flujo por fuente: buscar por título → página detalle →
 //   extraer URLs de video → filtrar latino → devolver streams.
 //
-// Cada fuente es un adaptador con:
-//   - id, name, mirrors[] (rotación de dominios)
-//   - search(title, year) → [{ pageUrl, title }]
-//   - getVideoUrls(pageUrl, { season, episode }) → [{ url, quality, server }]
-//
 // Restricciones de velocidad:
 //   - Timeout 5s por request (AT_TIMEOUT_MS)
 //   - Todo en paralelo vía Promise.all en fetchAlfaHttpSource
 //   - Cache en memoria 30min
+//   - Cap global de 7.5s por fuente (Promise.race) para no exceder
+//     el timeout de 8000ms configurado en Nuvio.
 // ---------------------------------------------------------------------------
 
 const cheerio = require("cheerio");
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const AH_TIMEOUT_MS = 5000; // 5s max por request
+const AH_TIMEOUT_MS = 5000;   // 5s max por request (genérico)
+const AH_SEARCH_MS = 4000;    // búsqueda de título
+const AH_DETAIL_MS = 3500;    // página detalle / episodio
+const AH_PLAYER_MS = 2500;    // página de reproductor (resolución de embed)
+const AH_SOURCE_CAP_MS = 7500; // cap total por fuente (Nuvio tolera 8s)
 
 // --- Mini caché local ---
 const _cache = new Map();
@@ -48,6 +49,39 @@ async function fetchWithTimeout(url, ms, options = {}) {
 	} finally {
 		clearTimeout(t);
 	}
+}
+
+// Fetch de HTML con timeout, UA y referer opcional. Lanza si !res.ok
+async function getHtml(url, ms, referer) {
+	const res = await fetchWithTimeout(url, ms, {
+		headers: {
+			"User-Agent": UA,
+			"Accept-Language": "es-MX,es;q=0.9",
+			...(referer ? { Referer: referer } : {}),
+		},
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	return await res.text();
+}
+
+// JSON embebido de apps Next.js (Cuevana2): <script type="application/json">...</script>
+function extractNextJson(html) {
+	const m = /<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/.exec(html || "");
+	if (!m) return null;
+	try { return JSON.parse(m[1]); } catch { return null; }
+}
+
+// Resolución ligera de páginas de reproductor: busca mp4/m3u8 o iframe final.
+// Devuelve null si no encuentra nada (el caller usa el embed tal cual).
+async function resolveEmbed(embedUrl, referer) {
+	try {
+		const data = await getHtml(embedUrl, AH_PLAYER_MS, referer);
+		const file = /(?:file|src)\s*[:=]\s*["'](https?:[^"']+\.(?:m3u8|mp4)[^"']*)["']/i.exec(data);
+		if (file) return file[1];
+		const iframe = /<iframe[^>]+src=["'](https?:[^"']+)["']/i.exec(data);
+		if (iframe && !/recaptcha|google\.com|about:blank/i.test(iframe[1])) return iframe[1];
+	} catch { /* timeout u error: se usa el embed */ }
+	return null;
 }
 
 // --- Título y año desde Cinemeta (compartido con alfa-torrents.js) ---
@@ -116,8 +150,9 @@ function parseQuality(text) {
 // --- Registro de fuentes ---
 const SOURCES = {};
 
-// Helper para crear un adaptador genérico de búsqueda HTML
-function makeHtmlSource(id, name, mirrors, { searchPath, resultSelector, titleSelector, linkSelector, getVideoUrls }) {
+// Helper para crear un adaptador genérico de búsqueda HTML.
+// extractTitle (opcional) permite títulos en atributos (ej. img[alt]).
+function makeHtmlSource(id, name, mirrors, { searchPath, resultSelector, titleSelector, linkSelector, extractTitle, getVideoUrls }) {
 	SOURCES[id] = {
 		id, name, mirrors,
 		async search(title, year) {
@@ -125,7 +160,7 @@ function makeHtmlSource(id, name, mirrors, { searchPath, resultSelector, titleSe
 			for (const mirror of mirrors) {
 				try {
 					const url = mirror + searchPath(encodeURIComponent(title));
-					const res = await fetchWithTimeout(url, AH_TIMEOUT_MS, {
+					const res = await fetchWithTimeout(url, AH_SEARCH_MS, {
 						headers: { "User-Agent": UA, "Accept-Language": "es-MX,es;q=0.9" },
 					});
 					if (!res.ok) continue;
@@ -133,13 +168,13 @@ function makeHtmlSource(id, name, mirrors, { searchPath, resultSelector, titleSe
 					const $ = cheerio.load(html);
 					$(resultSelector).each((_, el) => {
 						const $el = $(el);
-						const t = $el.find(titleSelector).text().trim() || $el.attr("title") || "";
+						const t = (extractTitle ? extractTitle($el, $) : "") ||
+							$el.find(titleSelector).text().trim() || $el.attr("title") || "";
 						let href = $el.find(linkSelector).attr("href") || $el.attr("href") || "";
 						if (href && !href.startsWith("http")) {
 							href = mirror + (href.startsWith("/") ? href : "/" + href);
 						}
 						if (t && href && titleMatch(title, t)) {
-							// Filtrar por año si está disponible
 							results.push({ pageUrl: href, title: t });
 						}
 					});
@@ -153,6 +188,276 @@ function makeHtmlSource(id, name, mirrors, { searchPath, resultSelector, titleSe
 		getVideoUrls,
 	};
 }
+
+// ===========================================================================
+// ADAPTADORES MVP — traducidos de plugin.video.alfa/channels/*.py
+// Referencia: https://github.com/alfa-addon/addon
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 1. Cuevana2Español — app Next.js; los players viajan en JSON embebido.
+//    Peli:  pageProps.post.players    {LANG: [{cyberlocker, quality, result}]}
+//    Serie: {serieUrl}/seasons/S/episodes/E → pageProps.episode.players
+// ---------------------------------------------------------------------------
+makeHtmlSource("cuevana2espanol", "Cuevana2Español",
+	["https://www.cuevana2espanol.net"],
+	{
+		searchPath: (q) => `/search?q=${q}`,
+		resultSelector: "a:has(h3)",
+		titleSelector: "h3",
+		linkSelector: "a",
+		getVideoUrls: async (pageUrl, { season, episode }) => {
+			const isSeries = season != null;
+			let url = pageUrl;
+			if (isSeries) {
+				if (!/\/serie\//.test(pageUrl)) return [];
+				url = `${pageUrl.replace(/\/$/, "")}/seasons/${season}/episodes/${episode ?? 1}`;
+			} else if (!/\/pelicula\//.test(pageUrl)) {
+				return [];
+			}
+			const html = await getHtml(url, AH_DETAIL_MS);
+			const json = extractNextJson(html);
+			const players = isSeries
+				? json?.props?.pageProps?.episode?.players
+				: json?.props?.pageProps?.post?.players;
+			if (!players) return [];
+			const out = [];
+			for (const [lang, infos] of Object.entries(players)) {
+				if (!isLatino(lang)) continue; // "LATINO" pasa, "CASTELLANO"/"SUBTITULADO" no
+				for (const info of infos || []) {
+					if (!info || !info.result) continue;
+					out.push({
+						url: info.result,
+						quality: parseQuality(info.quality || ""),
+						server: info.cyberlocker || "",
+						language: "latino",
+					});
+				}
+			}
+			return out;
+		},
+	});
+
+// ---------------------------------------------------------------------------
+// 2. PelisPlus — pestañas de servidores en div.bg-tabs con data-server
+//    (URL del servidor en base64). La página /player/{b64} revela el enlace
+//    final vía "Location.href = '...'".
+//    Serie: {serieUrl}/season/S/episode/E (patrón determinista, sin JSON).
+// ---------------------------------------------------------------------------
+makeHtmlSource("pelisplus", "PelisPlus",
+	["https://ww3.pelisplus.to"],
+	{
+		searchPath: (q) => `/search/${q}`,
+		resultSelector: "article.item",
+		titleSelector: "h2",
+		linkSelector: "a",
+		extractTitle: ($el) => ($el.find("img").attr("alt") || "").trim(),
+		getVideoUrls: async (pageUrl, { season, episode }, ctx = {}) => {
+			const isSeries = season != null;
+			let url = pageUrl;
+			if (isSeries) {
+				if (!/\/serie\//.test(pageUrl)) return [];
+				url = `${pageUrl.replace(/\/$/, "")}/season/${season}/episode/${episode ?? 1}`;
+			} else if (!/\/pelicula\//.test(pageUrl)) {
+				return [];
+			}
+			const mirror = "https://ww3.pelisplus.to";
+			const html = await getHtml(url, AH_DETAIL_MS);
+			const $ = cheerio.load(html);
+			const langAlt = ($("div.bg-tabs img[alt]").first().attr("alt") || "").trim();
+			// Filtro de idioma a nivel página (la bandera aplica a las pestañas).
+			// Sitio latino por defecto: sin bandera o con "Latino" se acepta;
+			// solo se descarta si se identifica castellano.
+			if (/castellano/i.test(langAlt)) return [];
+			const tabs = $("div.bg-tabs li[data-server]").slice(0, 6).toArray();
+			const out = [];
+			await Promise.all(tabs.map(async (el) => {
+				const raw = $(el).attr("data-server") || "";
+				if (!raw) return;
+				const server = ($(el).find("span").first().text().trim().split("-")[0] || "").trim();
+				const b64 = Buffer.from(raw, "utf8").toString("base64");
+				const playerUrl = `${mirror}/player/${b64}`;
+				try {
+					const pdata = await getHtml(playerUrl, AH_PLAYER_MS, url);
+					const m = /Location\.href\s*=\s*'([^']+)'/i.exec(pdata);
+					const final = m && /^https?:/.test(m[1]) ? m[1] : playerUrl;
+					out.push({ url: final, quality: parseQuality(server + " " + langAlt), server, language: "latino" });
+				} catch {
+					out.push({ url: playerUrl, quality: "HD", server, language: "latino" });
+				}
+			}));
+			return out;
+		},
+	});
+
+// ---------------------------------------------------------------------------
+// 3. EntrePeliculasySeries — reproductores en div.player-frame iframe.
+//    La página del iframe suele tener div.OptionsLangDisp con li[data-lang]
+//    (0=LAT, 1=CAST, 2=VOSE) y el enlace en el onclick (a veces base64).
+//    Serie: episodios en div#season-{S-1} div.episode-card a.
+// ---------------------------------------------------------------------------
+const EPS_LANGS = { "0": "lat", "1": "cast", "2": "vose" };
+
+makeHtmlSource("entrepeliculasyseries", "EntrePeliculasySeries",
+	["https://entrepeliculasyseries.nz"],
+	{
+		searchPath: (q) => `/search?page=1&s=${q}`,
+		resultSelector: "ul.post-lst article.post",
+		titleSelector: "h2",
+		linkSelector: "a",
+		extractTitle: ($el) => {
+			const t = $el.find("h2").length ? $el.find("h2").text() : $el.find("h3").text();
+			return (t || "").trim();
+		},
+		getVideoUrls: async (pageUrl, { season, episode }) => {
+			const isSeries = season != null;
+			let url = pageUrl;
+			if (isSeries) {
+				if (!/\/(serie|anime)\//.test(pageUrl)) return [];
+				const html0 = await getHtml(pageUrl, AH_DETAIL_MS);
+				const $0 = cheerio.load(html0);
+				let epHref = null;
+				$0(`div#season-${season - 1} div.episode-card a`).each((_, el) => {
+					if (epHref) return;
+					const txt = $0(el).text().replace(/\s+/g, " ").trim();
+					const m = /(\d+)\s*$/.exec(txt) || /episodio\s*(\d+)/i.exec(txt);
+					if (m && parseInt(m[1], 10) === (episode ?? 1)) epHref = $0(el).attr("href");
+				});
+				if (!epHref) return [];
+				url = epHref.startsWith("http") ? epHref : new URL(epHref, pageUrl).href;
+			} else if (!/\/pelicula\//.test(pageUrl)) {
+				return [];
+			}
+			const html = await getHtml(url, AH_DETAIL_MS);
+			const $ = cheerio.load(html);
+			const frames = $("div.player-frame iframe").toArray()
+				.map((el) => $(el).attr("src"))
+				.filter(Boolean);
+			const out = [];
+			for (const src0 of frames.slice(0, 4)) {
+				let src = src0.startsWith("http") ? src0 : new URL(src0, url).href;
+				if (/\/uqlink\./.test(src)) {
+					const id = /[?&]id=([A-Za-z0-9]+)/.exec(src)?.[1];
+					if (id) out.push({ url: `https://uqload.io/embed-${id}.html`, quality: "HD", server: "uqload", language: "latino" });
+					continue;
+				}
+				if (/waaw|netu|hqq/.test(src)) continue; // requieren interacción / bloqueados
+				try {
+					const pdata = await getHtml(src, AH_PLAYER_MS, url);
+					const $p = cheerio.load(pdata);
+					const opts = $p("div.OptionsLangDisp li").toArray();
+					if (!opts.length) {
+						// sin marcadores de idioma: embed latino por defecto del sitio
+						out.push({ url: src, quality: "HD", server: "", language: "latino" });
+						continue;
+					}
+					for (const li of opts) {
+						const lang = EPS_LANGS[$p(li).attr("data-lang")] || "";
+						const onclick = $p(li).attr("onclick") || "";
+						let vid = /'([^']+)'/.exec(onclick)?.[1] || "";
+						if (!vid) continue;
+						if (!/^https?:/.test(vid)) {
+							try { vid = Buffer.from(vid, "base64").toString("utf8"); } catch { /* seguir con vid crudo */ }
+						}
+						if (!/^https?:/.test(vid)) continue;
+						out.push({
+							url: vid,
+							quality: "HD",
+							server: $p(li).find("span").first().text().trim(),
+							language: lang || "latino",
+						});
+					}
+				} catch {
+					out.push({ url: src, quality: "HD", server: "", language: "latino" });
+				}
+			}
+			// Solo latino: "lat" aceptado, "cast"/"vose" descartados
+			return out.filter((v) => !v.language || v.language === "latino" || v.language === "lat" || isLatino(v.language));
+		},
+	});
+
+// ---------------------------------------------------------------------------
+// 4. SoloLatino — servidores en atributos data-server-url de la página
+//    detalle (película o página de episodio propia).
+//    Serie: temporadas en select#season-select, episodios en
+//    div[data-season-panel=S] a (cada episodio tiene su propia URL).
+// ---------------------------------------------------------------------------
+makeHtmlSource("sololatino", "SoloLatino",
+	["https://sololatino.net"],
+	{
+		searchPath: (q) => `/buscar?q=${q}`,
+		resultSelector: "div.movies-grid div.card",
+		titleSelector: "img",
+		linkSelector: "a",
+		extractTitle: ($el) => ($el.find("img").attr("alt") || "").trim(),
+		getVideoUrls: async (pageUrl, { season, episode }) => {
+			const isSeries = season != null;
+			let url = pageUrl;
+			if (isSeries) {
+				if (!/sololatino\.net\/(serie|anime|dorama)\//.test(pageUrl)) return [];
+				const html0 = await getHtml(pageUrl, AH_DETAIL_MS);
+				const $0 = cheerio.load(html0);
+				let epHref = null;
+				$0(`div[data-season-panel="${season}"] a`).each((_, el) => {
+					if (epHref) return;
+					const numTxt = $0(el).find("p.ep-num").text().trim().replace(/^E/i, "");
+					if (parseInt(numTxt, 10) === (episode ?? 1)) epHref = $0(el).attr("href");
+				});
+				if (!epHref) return [];
+				url = epHref.startsWith("http") ? epHref : new URL(epHref, pageUrl).href;
+			} else if (!/sololatino\.net\/pelicula\//.test(pageUrl)) {
+				return [];
+			}
+			const html = await getHtml(url, AH_DETAIL_MS);
+			// Servidores: atributos data-server-url (canal Alfa, películas y episodios)
+			const servers = [...html.matchAll(/data-server-url="([^"]+)"/g)]
+				.map((m) => m[1])
+				.filter(Boolean);
+			// Modelo nuevo alternativo: botones con data-player-{tipo} + API
+			if (!servers.length) {
+				const btns = [...html.matchAll(/data-player-\w+="([^"]+)"/g)].map((m) => m[1]);
+				servers.push(...btns.filter(Boolean));
+			}
+			const uniq = [...new Set(servers)].slice(0, 5);
+			const out = [];
+			await Promise.all(uniq.map(async (s) => {
+				const embed = s.startsWith("http") ? s : new URL(s, url).href;
+				// Página de servidor tipo xupalace: lista de idiomas por data-lang
+				let vid = null;
+				try {
+					const pdata = await getHtml(embed, AH_PLAYER_MS, url);
+					const $p = cheerio.load(pdata);
+					const opts = $p("div.OptionsLangDisp li").toArray();
+					if (opts.length) {
+						for (const li of opts) {
+							const lang = EPS_LANGS[$p(li).attr("data-lang")] || "lat";
+							if (lang !== "lat") continue;
+							const onclick = $p(li).attr("onclick") || "";
+							let v = /'([^']+)'/.exec(onclick)?.[1] || "";
+							if (v && !/^https?:/.test(v)) {
+								try { v = Buffer.from(v, "base64").toString("utf8"); } catch { /* crudo */ }
+							}
+							if (v && /^https?:/.test(v)) vid = v;
+						}
+					}
+				} catch { /* embed directo */ }
+				out.push({
+					url: vid || embed,
+					quality: "HD",
+					server: "",
+					language: "latino",
+				});
+			}));
+			return out;
+		},
+	});
+
+// ---------------------------------------------------------------------------
+// NOTA HDFull: NO incluido en el MVP. El canal de Alfa requiere cuenta de
+// usuario (login con token CSRF), la librería ofuscada alfaresolver y
+// js/providers.js para descifrar los enlaces. No es replicable con fetch
+// simple desde Node. Alternativa sugerida: repelishd.cam (RepelisHD).
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Orquestador principal
@@ -202,10 +507,23 @@ async function fetchAlfaHttpSource(sourceId, type, id, season, episode) {
 	}
 }
 
-// Fetch paralelo de múltiples fuentes HTTP con timeout global
+// Cap duro de latencia por fuente: si una fuente tarda más de ms, se descarta
+// para no exceder el timeout de 8000ms que tiene Nuvio configurado.
+function withTimeout(promise, ms) {
+	return Promise.race([
+		promise,
+		new Promise((_, reject) => setTimeout(() => reject(new Error("cap de tiempo excedido")), ms)),
+	]);
+}
+
+// Fetch paralelo de múltiples fuentes HTTP con cap global por fuente
 async function fetchAllHttpSources(type, id, season, episode, sourceIds) {
 	const jobs = sourceIds.map(srcId =>
-		fetchAlfaHttpSource(srcId, type, id, season, episode).catch(() => [])
+		withTimeout(fetchAlfaHttpSource(srcId, type, id, season, episode), AH_SOURCE_CAP_MS)
+			.catch((e) => {
+				console.warn(`HTTP ${srcId} descartado por latencia:`, e.message);
+				return [];
+			})
 	);
 	const results = await Promise.all(jobs);
 	return results.flat();

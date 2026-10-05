@@ -24,9 +24,10 @@ const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 // Fuentes HTTP habilitadas (se agregan conforme se implementan adaptadores en alfa-http.js)
 // TODO: Actualizar según resultados de auditoría
 const HTTP_SOURCES_ENABLED = [
-	// "sololatino",
-	// "cuevana2espanol",
-	// "pelisplus",
+	"cuevana2espanol",
+	"pelisplus",
+	"entrepeliculasyseries",
+	"sololatino",
 ];
 
 // ---------------------------------------------------------------------------
