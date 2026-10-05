@@ -18,7 +18,7 @@ const { fetchAlfaTorrentSource } = require("./alfa-torrents.js");
 
 const TORRENTIO_BASE = "https://torrentio.strem.fun";
 const TORBOX_API = "https://api.torbox.app/v1/api";
-const UA = "LatinoStreams/1.0 (+stremio-addon)";
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // ---------------------------------------------------------------------------
 // Manifest
