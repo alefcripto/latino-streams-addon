@@ -1136,6 +1136,30 @@ code{background:#0b0f18;padding:2px 6px;border-radius:6px}</style></head>
 </div></body></html>`);
 });
 
+// Endpoint de diagnóstico: prueba cada fuente y reporta estado
+app.get("/debug/sources", async (req, res) => {
+	const results = {};
+	const test = async (name, fn) => {
+		const t0 = Date.now();
+		try {
+			const r = await fn();
+			results[name] = { ok: true, count: Array.isArray(r) ? r.length : 0, ms: Date.now() - t0 };
+		} catch (e) {
+			results[name] = { ok: false, error: e.message.slice(0, 100), ms: Date.now() - t0 };
+		}
+	};
+	// Probar con Deadpool 2 (tt5463162) que sabemos tiene contenido latino
+	await test("elitetorrent", () => fetchAlfaTorrentSource("elitetorrent", "movie", "tt5463162", null, null));
+	await test("hacktorrent", () => fetchAlfaTorrentSource("hacktorrent", "movie", "tt5463162", null, null));
+	await test("torrentio", async () => {
+		const r = await fetch(`${TORRENTIO_BASE}/stream/movie/tt5463162.json`, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(8000) });
+		if (!r.ok) throw new Error(`HTTP ${r.status}`);
+		const j = await r.json();
+		return j.streams || [];
+	});
+	res.json({ timestamp: new Date().toISOString(), results });
+});
+
 // Rutas del protocolo Stremio (manifest, stream) — con soporte de config en la URL
 app.use(getRouter(builder.getInterface()));
 
