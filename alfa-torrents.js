@@ -563,7 +563,7 @@ function makeWpJsonSource(name, mirrors) {
 	};
 }
 
-SOURCES.hacktorrent = makeWpJsonSource("HackTorrent", ["https://hacktorrent.to"]);
+SOURCES.hacktorrent = makeWpJsonSource("HackTorrent", ["https://hacktorrent.cc", "https://hacktorrent.to"]);
 SOURCES.pelispanda = makeWpJsonSource("PelisPanda", ["https://pelispanda.org"]);
 
 // ---------------------------------------------------------------------------
