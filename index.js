@@ -143,7 +143,15 @@ function shortHash(s) {
 // ---------------------------------------------------------------------------
 // Detección de latino + parseo de calidad/seeders
 // ---------------------------------------------------------------------------
-const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|latinoam[eé]rica/i;
+const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|latinoam[eé]rica|dual[\s._-]*lat\b|wolfmax4k/i;
+// 🇪🇸 solo cuenta como latino si NO es parte de una lista multi-idioma
+function hasLatinoFlag(text) {
+	if (!/🇪🇸/.test(text)) return false;
+	// Contar banderas de países; si hay 3+, es multi-idioma (subtítulos), no doblaje latino
+	const flags = (text.match(/🇬🇧|🇮🇹|🇵🇹|🇫🇷|🇩🇪|🇳🇱|🇪🇸|🇲🇽|🇦🇷|🇨🇴/g) || []).length;
+	if (flags >= 3) return false;
+	return true;
+}
 const DUAL_RE = /\bdual\b/i;
 const SPAIN_RE = /castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish\s*\(spain\)/i;
 const SEEDERS_RE = /👤\s*([\d.,]+)/;
@@ -165,7 +173,7 @@ function parseTorrentioStream(raw) {
 
 	// tier: 0 = latino confirmado, 1 = dual (probablemente latino), 2 = descartar
 	let tier = 2;
-	if (LATINO_RE.test(text)) tier = 0;
+	if (LATINO_RE.test(text) || hasLatinoFlag(text)) tier = 0;
 	else if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) tier = 1;
 	else if (SPAIN_RE.test(text)) tier = 2;
 	if (tier === 2) return null;

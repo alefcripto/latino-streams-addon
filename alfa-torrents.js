@@ -154,14 +154,21 @@ function magnetInfoHash(magnet) {
 }
 
 // --- Detección de idioma / calidad ---
-const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|latinoam[eé]rica/i;
+const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|latinoam[eé]rica|dual[\s._-]*lat\b|wolfmax4k/i;
+// 🇪🇸 solo cuenta como latino si NO es parte de una lista multi-idioma
+function hasLatinoFlag(text) {
+	if (!/🇪🇸/.test(text)) return false;
+	const flags = (text.match(/🇬🇧|🇮🇹|🇵🇹|🇫🇷|🇩🇪|🇳🇱|🇪🇸|🇲🇽|🇦🇷|🇨🇴/g) || []).length;
+	if (flags >= 3) return false;
+	return true;
+}
 const DUAL_RE = /\bdual\b/i;
 const SPAIN_RE = /castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish\s*\(spain\)/i;
 const HINDI_RE = /hindi|hind[ií]/i;
 
 function latinoTier(text) {
 	if (HINDI_RE.test(text)) return -1; // excluir falsos "dual" hindi+eng
-	if (LATINO_RE.test(text)) return 0;
+	if (LATINO_RE.test(text) || hasLatinoFlag(text)) return 0;
 	if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) return 1;
 	return 2;
 }
