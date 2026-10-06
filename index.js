@@ -125,21 +125,48 @@ const manifest = {
 };
 
 // ---------------------------------------------------------------------------
-// Mini caché en memoria con TTL
+// Caché en memoria con TTL + LRU acotada + single-flight + stale fallback
+// (adaptado del patrón de xTremio v2.0.0)
 // ---------------------------------------------------------------------------
 const _cache = new Map();
-function cacheGet(key) {
+const _inflight = new Map(); // single-flight: key -> Promise en curso
+const CACHE_MAX = 5000;
+const STALE_MS = 6 * 60 * 60 * 1000; // 6h: cuánto se conserva una entrada vencida como respaldo
+
+function cacheGet(key, { allowStale = false } = {}) {
 	const e = _cache.get(key);
 	if (!e) return null;
-	if (Date.now() > e.exp) {
+	if (Date.now() <= e.exp) {
+		// LRU: mover al final (más reciente)
 		_cache.delete(key);
-		return null;
+		_cache.set(key, e);
+		return { val: e.val, stale: false };
 	}
-	return e.val;
+	// Vencida: ¿servir como respaldo?
+	if (allowStale && Date.now() <= e.exp + STALE_MS) {
+		return { val: e.val, stale: true };
+	}
+	_cache.delete(key);
+	return null;
 }
 function cacheSet(key, val, ttlMs) {
-	if (_cache.size > 5000) _cache.delete(_cache.keys().next().value);
+	if (_cache.has(key)) _cache.delete(key);
+	else if (_cache.size >= CACHE_MAX) _cache.delete(_cache.keys().next().value); // LRU: saca la más vieja
 	_cache.set(key, { val, exp: Date.now() + ttlMs });
+}
+// Single-flight: si ya hay una petición en curso para esta key, espera su
+// resultado en vez de lanzar otra (evita martillear las fuentes).
+function withSingleFlight(key, fn) {
+	if (_inflight.has(key)) return _inflight.get(key);
+	const p = (async () => {
+		try {
+			return await fn();
+		} finally {
+			_inflight.delete(key);
+		}
+	})();
+	_inflight.set(key, p);
+	return p;
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -244,7 +271,7 @@ function formatBytes(b) {
 async function fetchTorrentio(type, id) {
 	const cacheKey = `src:torrentio:${type}:${id}`;
 	const hit = cacheGet(cacheKey);
-	if (hit) return hit;
+	if (hit) return hit.val;
 
 	const url = `${TORRENTIO_BASE}/stream/${type}/${encodeURIComponent(id)}.json`;
 	const res = await fetchWithTimeout(url, SOURCE_TIMEOUT_MS, {
@@ -265,7 +292,7 @@ async function fetchEZTV(type, id, season, episode) {
 	if (type !== "series" || season == null) return [];
 	const cacheKey = `src:eztv:${id}:${season}:${episode}`;
 	const hit = cacheGet(cacheKey);
-	if (hit) return hit;
+	if (hit) return hit.val;
 
 	const imdb = String(id).split(":")[0].replace(/^tt/, "");
 	const url = `https://eztv.re/api/get-torrents?imdb_id=${imdb}&limit=100`;
@@ -317,7 +344,7 @@ async function fetchTitle(type, id) {
 	const imdb = String(id).split(":")[0];
 	const cacheKey = `title:${type}:${imdb}`;
 	const hit = cacheGet(cacheKey);
-	if (hit) return hit;
+	if (hit) return hit.val;
 	try {
 		const res = await fetchWithTimeout(`https://v3-cinemeta.strem.io/meta/${type}/${imdb}.json`, 8000, {
 			headers: { "User-Agent": UA },
@@ -419,7 +446,7 @@ function normTitle(s) {
 async function fetchGranTorrent(type, id, season, episode) {
 	const cacheKey = `src:grantorrent:${type}:${id}`;
 	const hit = cacheGet(cacheKey);
-	if (hit) return hit;
+	if (hit) return hit.val;
 	try {
 		const title = await fetchTitle(type, id);
 		if (!title) return [];
@@ -593,7 +620,7 @@ function parseExtraSourceUrls(raw) {
 async function fetchCustomSource(origin, type, id) {
 	const cacheKey = `src:custom:${origin}:${type}:${id}`;
 	const hit = cacheGet(cacheKey);
-	if (hit) return hit;
+	if (hit) return hit.val;
 
 	const url = `${origin}/stream/${type}/${encodeURIComponent(id)}.json`;
 	const res = await fetchWithTimeout(url, SOURCE_TIMEOUT_MS, {
@@ -627,7 +654,7 @@ async function fetchTorznab(torznabUrl, torznabKey, type, id, season, episode) {
 	if (!torznabUrl) return [];
 	const cacheKey = `src:torznab:${type}:${id}`;
 	const hit = cacheGet(cacheKey);
-	if (hit) return hit;
+	if (hit) return hit.val;
 
 	const imdb = String(id).split(":")[0].replace(/^tt/, "");
 	const base = torznabUrl.replace(/\/$/, "");
@@ -687,7 +714,28 @@ async function fetchTorznab(torznabUrl, torznabKey, type, id, season, episode) {
 async function fetchAllSources(type, id, { season, episode, config }) {
 	const cacheKey = `all:${type}:${id}:${config.srcTorrentio ? 1 : 0}${config.srcEztv ? 1 : 0}${config.srcGrantorrent ? 1 : 0}${config.srcElitetorrent ? 1 : 0}${config.srcMitorrent ? 1 : 0}${config.srcHacktorrent ? 1 : 0}:${shortHash(config.extraSources)}:${shortHash(config.torznabUrl)}`;
 	const hit = cacheGet(cacheKey);
-	if (hit) return hit;
+	if (hit) return hit.val;
+
+	// Single-flight: peticiones paralelas idénticas comparten una sola ejecución
+	return withSingleFlight("sf:" + cacheKey, async () => {
+		// Doble chequeo tras entrar al single-flight (otra petición pudo poblar el caché)
+		const hit2 = cacheGet(cacheKey);
+		if (hit2) return hit2.val;
+		try {
+			return await _fetchAllSourcesInner(type, id, { season, episode, config });
+		} catch (e) {
+			// Stale fallback: si todo falla, servir copia vencida antes que vacío
+			const stale = cacheGet(cacheKey, { allowStale: true });
+			if (stale) {
+				console.warn("Sirviendo caché vencido para", cacheKey.slice(0, 40));
+				return stale.val;
+			}
+			throw e;
+		}
+	});
+}
+
+async function _fetchAllSourcesInner(type, id, { season, episode, config }) {
 
 	const jobs = [];
 	if (config.srcTorrentio !== false) {
@@ -791,7 +839,7 @@ async function torboxCall(key, path, { method = "GET", body = null, form = null 
 async function verifyTorboxKey(key) {
 	const cacheKey = `tbkey:${key.slice(0, 12)}`;
 	const hit = cacheGet(cacheKey);
-	if (hit !== null) return hit;
+	if (hit !== null) return hit.val;
 	try {
 		await torboxCall(key, "/user/me");
 		cacheSet(cacheKey, true, 60 * 60 * 1000);
@@ -808,7 +856,7 @@ async function checkCached(key, hashes) {
 	if (!uniq.length) return {};
 	const cacheKey = `cached:${shortHash(uniq.sort().join(","))}`;
 	const hit = cacheGet(cacheKey);
-	if (hit) return hit;
+	if (hit) return hit.val;
 
 	// GET con query params (equivalente documentado a instantAvailability)
 	const qs = new URLSearchParams({
@@ -857,7 +905,7 @@ function pickFile(files, { isSeries, season, episode, hintFilename }) {
 async function resolveViaTorbox(key, stream, { isSeries, season, episode }) {
 	const cacheKey = `resolved:${stream.infoHash}:${isSeries ? `${season}x${episode}` : "movie"}`;
 	const hit = cacheGet(cacheKey);
-	if (hit) return hit;
+	if (hit) return hit.val;
 
 	// 1. agregar el magnet a TorBox (si ya está cacheado es casi instantáneo)
 	const form = new FormData();
@@ -962,7 +1010,9 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 				},
 			}),
 			HTTP_SOURCES_ENABLED.length
-				? fetchAllHttpSources(type, id, season, episode, HTTP_SOURCES_ENABLED).catch(() => [])
+				? withSingleFlight(`sf:http:${type}:${id}`, () =>
+					fetchAllHttpSources(type, id, season, episode, HTTP_SOURCES_ENABLED).catch(() => [])
+				)
 				: Promise.resolve([]),
 		]);
 
