@@ -170,6 +170,30 @@ function withSingleFlight(key, fn) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---------------------------------------------------------------------------
+// Orquestación v2 (solo orquestación; los scrapers no se tocan):
+// - Deadline global al recolectar fuentes: las lentas no arrastran el total.
+// - Respuestas parciales: se devuelve lo que haya llegado al cumplirse el deadline.
+// - Caché corta (5 min) de la respuesta final: reintentos de Nuvio al instante.
+// - Timeouts en llamadas TorBox: ninguna puede colgarse eternamente.
+// ---------------------------------------------------------------------------
+const GATHER_DEADLINE_MS = 9000;   // recolectar fuentes torrent
+const RESOLVE_DEADLINE_MS = 4000;  // resolución vía TorBox
+const STREAM_CACHE_TTL_MS = 5 * 60 * 1000; // caché corta de la respuesta final
+const TORBOX_TIMEOUT_MS = 10000;   // timeout por llamada a la API de TorBox
+
+// Latencia reciente por fuente (media móvil): detecta las lentas crónicas.
+const _srcLat = new Map(); // name -> { avg, n }
+function recordLatency(name, ms) {
+	const e = _srcLat.get(name) || { avg: ms, n: 0 };
+	e.n += 1;
+	e.avg = e.avg * 0.7 + ms * 0.3;
+	_srcLat.set(name, e);
+	if (e.n >= 3 && e.avg > GATHER_DEADLINE_MS * 0.75) {
+		console.warn(`Fuente lenta: ${name} promedia ${Math.round(e.avg)}ms en ${e.n} consultas`);
+	}
+}
+
 function shortHash(s) {
 	let h = 0;
 	const str = String(s || "");
@@ -722,7 +746,7 @@ async function fetchAllSources(type, id, { season, episode, config }) {
 		const hit2 = cacheGet(cacheKey);
 		if (hit2) return hit2.val;
 		try {
-			return await _fetchAllSourcesInner(type, id, { season, episode, config });
+			return await _fetchAllSourcesInner(type, id, { season, episode, config, cacheKey });
 		} catch (e) {
 			// Stale fallback: si todo falla, servir copia vencida antes que vacío
 			const stale = cacheGet(cacheKey, { allowStale: true });
@@ -735,77 +759,67 @@ async function fetchAllSources(type, id, { season, episode, config }) {
 	});
 }
 
-async function _fetchAllSourcesInner(type, id, { season, episode, config }) {
+async function _fetchAllSourcesInner(type, id, { season, episode, config, cacheKey }) {
 
 	const jobs = [];
-	if (config.srcTorrentio !== false) {
-		jobs.push(
-			fetchTorrentio(type, id).catch((e) => {
-				console.warn("Torrentio falló:", e.message);
+	const addJob = (name, promise) => {
+		jobs.push({
+			name,
+			promise: promise.catch((e) => {
+				console.warn(`${name} falló:`, e.message);
 				return [];
-			})
-		);
-	}
-	if (config.srcEztv !== false) {
-		jobs.push(
-			fetchEZTV(type, id, season, episode).catch((e) => {
-				console.warn("EZTV falló:", e.message);
-				return [];
-			})
-		);
-	}
-	if (config.srcGrantorrent !== false) {
-		jobs.push(
-			fetchGranTorrent(type, id, season, episode).catch((e) => {
-				console.warn("GranTorrent falló:", e.message);
-				return [];
-			})
-		);
-	}
+			}),
+		});
+	};
+	if (config.srcTorrentio !== false) addJob("torrentio", fetchTorrentio(type, id));
+	if (config.srcEztv !== false) addJob("eztv", fetchEZTV(type, id, season, episode));
+	if (config.srcGrantorrent !== false) addJob("grantorrent", fetchGranTorrent(type, id, season, episode));
 	for (const [cfgKey, srcId] of [
 		["srcElitetorrent", "elitetorrent"],
 		["srcMitorrent", "mitorrent"],
 		["srcHacktorrent", "hacktorrent"],
 	]) {
 		if (config[cfgKey] !== false) {
-			jobs.push(
-				fetchAlfaTorrentSource(srcId, type, id, season, episode).catch((e) => {
-					console.warn(`${srcId} falló:`, e.message);
-					return [];
-				})
-			);
+			addJob(srcId, fetchAlfaTorrentSource(srcId, type, id, season, episode));
 		}
 	}
 	for (const origin of parseExtraSourceUrls(config.extraSources)) {
-		jobs.push(
-			fetchCustomSource(origin, type, id).catch((e) => {
-				console.warn(`Fuente extra ${origin} falló:`, e.message);
-				return [];
-			})
-		);
+		addJob("extra:" + origin, fetchCustomSource(origin, type, id));
 	}
 	if (config.torznabUrl) {
-		jobs.push(
-			fetchTorznab(config.torznabUrl, config.torznabKey, type, id, season, episode).catch(
-				(e) => {
-					console.warn("Torznab falló:", e.message);
-					return [];
-				}
-			)
-		);
+		addJob("torznab", fetchTorznab(config.torznabUrl, config.torznabKey, type, id, season, episode));
 	}
 
-	const results = await Promise.all(jobs);
-
-	// Unir + deduplicar por infoHash (gana la primera fuente que lo trajo)
+	// Recolectar a medida que cada fuente responde, con deadline global.
+	// Las fuentes lentas NO arrastran el tiempo total: se descartan para esta
+	// petición, pero sus promesas siguen en segundo plano calentando su
+	// propia caché para la próxima vez.
 	const seen = new Set();
 	const merged = [];
-	for (const list of results) {
-		for (const s of list) {
+	const t0 = Date.now();
+	const pending = new Map(jobs.map((j, i) => [i, j]));
+	while (pending.size > 0) {
+		const remain = GATHER_DEADLINE_MS - (Date.now() - t0);
+		if (remain <= 0) break;
+		const settled = await Promise.race([
+			...[...pending.entries()].map(([i, j]) =>
+				j.promise.then((list) => ({ i, name: j.name, list, ms: Date.now() - t0 }))
+			),
+			sleep(remain).then(() => null), // deadline: no esperar más
+		]);
+		if (settled === null) break; // se acabó el tiempo: devolver parciales
+		pending.delete(settled.i);
+		recordLatency(settled.name, settled.ms);
+		for (const s of settled.list || []) {
 			if (!s || seen.has(s.infoHash)) continue;
 			seen.add(s.infoHash);
 			merged.push(s);
 		}
+	}
+	if (pending.size > 0) {
+		console.warn(
+			`Deadline ${GATHER_DEADLINE_MS}ms: ${[...pending.values()].map((j) => j.name).join(", ")} no respondieron a tiempo`
+		);
 	}
 
 	// Filtrar solo latino y ordenar
@@ -826,7 +840,12 @@ async function torboxCall(key, path, { method = "GET", body = null, form = null 
 		headers["Content-Type"] = "application/json";
 		payload = JSON.stringify(body);
 	}
-	const res = await fetch(TORBOX_API + path, { method, headers, body: payload });
+	const res = await fetch(TORBOX_API + path, {
+		method,
+		headers,
+		body: payload,
+		signal: AbortSignal.timeout(TORBOX_TIMEOUT_MS),
+	});
 	const json = await res.json().catch(() => ({}));
 	if (!res.ok || json.success === false) {
 		const err = new Error(json.error || json.detail || `TorBox HTTP ${res.status}`);
@@ -976,12 +995,68 @@ async function mapLimit(items, limit, fn) {
 	return results;
 }
 
+// mapLimit con deadline: si se acaba el tiempo devuelve los resultados
+// parciales completados hasta el momento. Las tareas en curso siguen en
+// segundo plano y calientan sus cachés.
+async function mapLimitDeadline(items, limit, ms, fn) {
+	const results = new Array(items.length).fill(null);
+	let i = 0;
+	let stopped = false;
+	async function worker() {
+		while (!stopped && i < items.length) {
+			const idx = i++;
+			try {
+				results[idx] = await fn(items[idx], idx);
+			} catch (e) {
+				results[idx] = null;
+			}
+		}
+	}
+	const workers = Promise.all(
+		Array.from({ length: Math.min(limit, items.length) }, worker)
+	);
+	await Promise.race([workers, sleep(ms).then(() => { stopped = true; })]);
+	return results;
+}
+
 // ---------------------------------------------------------------------------
 // Addon
 // ---------------------------------------------------------------------------
 const builder = new addonBuilder(manifest);
 
+// Clave de la caché corta de respuesta final: todo lo que cambia la salida.
+function streamCacheKey(type, id, config) {
+	const c = config || {};
+	const relevant = {
+		t: type,
+		id: String(id),
+		tb: c.torboxKey ? shortHash(c.torboxKey) : "-",
+		io: c.instantOnly !== false ? 1 : 0,
+		mx: String(c.maxResults || "8"),
+		src: ["srcTorrentio", "srcEztv", "srcGrantorrent", "srcElitetorrent", "srcMitorrent", "srcHacktorrent"]
+			.map((k) => (c[k] === false ? 0 : 1)).join(""),
+		ex: shortHash(c.extraSources || ""),
+		tz: shortHash((c.torznabUrl || "").trim()),
+	};
+	return `stream:${type}:${String(id).slice(0, 64)}:${shortHash(JSON.stringify(relevant))}`;
+}
+
 builder.defineStreamHandler(async ({ type, id, config }) => {
+	// Caché corta de la respuesta final: los reintentos de Nuvio y la
+	// navegación atrás/adelante responden al instante (<1s).
+	const skey = streamCacheKey(type, id, config);
+	const hit = cacheGet(skey);
+	if (hit) return hit.val;
+	return withSingleFlight("sf:" + skey, async () => {
+		const hit2 = cacheGet(skey);
+		if (hit2) return hit2.val;
+		const out = await _streamHandlerInner({ type, id, config });
+		cacheSet(skey, out, STREAM_CACHE_TTL_MS);
+		return out;
+	});
+});
+
+async function _streamHandlerInner({ type, id, config }) {
 	try {
 		const { torboxKey = "", instantOnly = true, maxResults = "8" } = config || {};
 		const max = Math.min(Math.max(parseInt(maxResults, 10) || 8, 1), 12);
@@ -1038,7 +1113,7 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 			const uncachedOnes = latino.filter((s) => !cached[s.infoHash]);
 			const pool = instantOnly ? cachedOnes : [...cachedOnes, ...uncachedOnes];
 
-			const resolved = await mapLimit(pool.slice(0, max), 4, async (s) => {
+			const resolved = await mapLimitDeadline(pool.slice(0, max), 4, RESOLVE_DEADLINE_MS, async (s) => {
 				if (!cached[s.infoHash]) {
 					// sin caché: devolver el magnet para el motor de Stremio
 					return {
@@ -1080,7 +1155,7 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 		console.error("stream handler error:", err.message);
 		return { streams: [] };
 	}
-});
+}
 
 const addonInterface = builder.getInterface();
 
