@@ -35,7 +35,7 @@ const HTTP_SOURCES_ENABLED = [
 // ---------------------------------------------------------------------------
 const manifest = {
 	id: "com.latino-streams.torbox",
-	version: "1.0.0",
+	version: "1.0.1",
 	name: "Latino Streams ⚡",
 	description:
 		"Las mejores fuentes en español latino, reproducidas al instante con tu cuenta de TorBox.",
