@@ -178,6 +178,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // - Timeouts en llamadas TorBox: ninguna puede colgarse eternamente.
 // ---------------------------------------------------------------------------
 const GATHER_DEADLINE_MS = 9000;   // recolectar fuentes torrent
+const EARLY_EXIT_TIER0 = 8;        // salida temprana: con 8 latinos confirmados no se espera más
+const CB_FAILS = 3;                // circuit breaker: fallos seguidos para saltar una fuente
+const CB_SKIP_MS = 30 * 60 * 1000; // ...durante 30 minutos
 const RESOLVE_DEADLINE_MS = 4000;  // resolución vía TorBox
 const STREAM_CACHE_TTL_MS = 5 * 60 * 1000; // caché corta de la respuesta final
 const TORBOX_TIMEOUT_MS = 10000;   // timeout por llamada a la API de TorBox
@@ -192,6 +195,21 @@ function recordLatency(name, ms) {
 	if (e.n >= 3 && e.avg > GATHER_DEADLINE_MS * 0.75) {
 		console.warn(`Fuente lenta: ${name} promedia ${Math.round(e.avg)}ms en ${e.n} consultas`);
 	}
+}
+
+// Circuit breaker: saltar fuentes que fallan o no responden de forma repetida
+const _srcFail = new Map(); // name -> { fails, until }
+function circuitOpen(name) {
+	const e = _srcFail.get(name);
+	return !!e && e.fails >= CB_FAILS && Date.now() < e.until;
+}
+function recordSuccess(name) { _srcFail.delete(name); }
+function recordFailure(name) {
+	const e = _srcFail.get(name) || { fails: 0, until: 0 };
+	e.fails += 1;
+	e.until = Date.now() + CB_SKIP_MS;
+	_srcFail.set(name, e);
+	if (e.fails === CB_FAILS) console.warn(`Circuit breaker: ${name} se salta por 30 min tras ${e.fails} fallos seguidos`);
 }
 
 function shortHash(s) {
@@ -768,12 +786,16 @@ async function _fetchAllSourcesInner(type, id, { season, episode, config, cacheK
 
 	const jobs = [];
 	const addJob = (name, promise) => {
+		if (circuitOpen(name)) {
+			console.log(`Saltando ${name} (circuit breaker abierto)`);
+			return;
+		}
 		jobs.push({
 			name,
-			promise: promise.catch((e) => {
-				console.warn(`${name} falló:`, e.message);
-				return [];
-			}),
+			promise: promise.then(
+				(list) => { recordSuccess(name); return list; },
+				(e) => { console.warn(`${name} falló:`, e.message); recordFailure(name); return []; }
+			),
 		});
 	};
 	if (config.srcTorrentio !== false) addJob("torrentio", fetchTorrentio(type, id));
@@ -820,7 +842,16 @@ async function _fetchAllSourcesInner(type, id, { season, episode, config, cacheK
 			seen.add(s.infoHash);
 			merged.push(s);
 		}
+		// Salida temprana: con suficientes latinos confirmados no se espera el deadline
+		let tier0 = 0;
+		for (const s of merged) if (s.tier === 0 && ++tier0 >= EARLY_EXIT_TIER0) break;
+		if (tier0 >= EARLY_EXIT_TIER0) {
+			console.log(`Salida temprana: ${tier0} latinos confirmados en ${Date.now() - t0}ms`);
+			break;
+		}
 	}
+	// Las que no respondieron a tiempo cuentan como fallo para el circuit breaker
+	for (const [, j] of pending) recordFailure(j.name);
 	if (pending.size > 0) {
 		console.warn(
 			`Deadline ${GATHER_DEADLINE_MS}ms: ${[...pending.values()].map((j) => j.name).join(", ")} no respondieron a tiempo`
