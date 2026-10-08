@@ -217,12 +217,15 @@ const DUAL_RE = /\bdual\b/i;
 const SPAIN_RE = /castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish\s*\(spain\)/i;
 // Rechazo explícito: portugués, castellano y solo-subtítulos nunca son latino
 const REJECT_RE = /portugu[eê]s|\bpt[\s._-]?br\b|\bdublad[oa]\b|\blegendad[oa]\b|🇧🇷|\bbrazilian\b|castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish|\bsubtitulad[oa]\b|\bvose\b/i;
+// Etiqueta genérica "español": probablemente latino si no hay marca de rechazo
+const ESPANOL_RE = /espa[ñn]ol/i;
 
-// Clasificación de idioma: 0 = latino confirmado, 1 = dual (probablemente latino), 2 = descartar
+// Clasificación: 0 = latino confirmado (latino, español latino, [LAT], 🇲🇽...), 1 = probablemente latino (dual, español), 2 = descartar
 function classifyTier(text) {
 	if (LATINO_RE.test(text) || hasLatinoFlag(text)) return 0;
 	if (REJECT_RE.test(text)) return 2;
 	if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) return 1;
+	if (ESPANOL_RE.test(text)) return 1;
 	return 2;
 }
 const SEEDERS_RE = /👤\s*([\d.,]+)/;
