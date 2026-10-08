@@ -205,11 +205,11 @@ function shortHash(s) {
 // Detección de latino + parseo de calidad/seeders
 // ---------------------------------------------------------------------------
 const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|latinoam[eé]rica|dual[\s._-]*lat\b|wolfmax4k/i;
-// 🇪🇸 solo cuenta como latino si NO es parte de una lista multi-idioma
+// 🇪🇸 es castellano (España), NO latino: solo las banderas latinoamericanas cuentan
 function hasLatinoFlag(text) {
-	if (!/🇪🇸/.test(text)) return false;
+	if (!/🇲🇽|🇦🇷|🇨🇴|🇨🇱|🇵🇪|🇻🇪|🇺🇾|🇪🇨/.test(text)) return false;
 	// Contar banderas de países; si hay 3+, es multi-idioma (subtítulos), no doblaje latino
-	const flags = (text.match(/🇬🇧|🇮🇹|🇵🇹|🇫🇷|🇩🇪|🇳🇱|🇪🇸|🇲🇽|🇦🇷|🇨🇴/g) || []).length;
+	const flags = (text.match(/🇬🇧|🇮🇹|🇵🇹|🇫🇷|🇩🇪|🇳🇱|🇪🇸|🇲🇽|🇦🇷|🇨🇴|🇨🇱|🇵🇪|🇻🇪|🇺🇾|🇪🇨/g) || []).length;
 	if (flags >= 3) return false;
 	return true;
 }
