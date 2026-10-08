@@ -204,7 +204,7 @@ function shortHash(s) {
 // ---------------------------------------------------------------------------
 // Detección de latino + parseo de calidad/seeders
 // ---------------------------------------------------------------------------
-const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|\blat\b|latinoam[eé]rica|dual[\s._-]*lat\b|wolfmax4k/i;
+const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|\blat\b|latinoam[eé]rica|dual[\s._-]*lat\b/i;
 // 🇪🇸 es castellano (España), NO latino: solo las banderas latinoamericanas cuentan
 function hasLatinoFlag(text) {
 	if (!/🇲🇽|🇦🇷|🇨🇴|🇨🇱|🇵🇪|🇻🇪|🇺🇾|🇪🇨/.test(text)) return false;
@@ -223,6 +223,7 @@ const ESPANOL_RE = /espa[ñn]ol/i;
 // Clasificación: 0 = latino confirmado (latino, español latino, [LAT], 🇲🇽...), 1 = probablemente latino (dual, español), 2 = descartar
 function classifyTier(text) {
 	if (LATINO_RE.test(text) || hasLatinoFlag(text)) return 0;
+	if (/🇪🇸|🇵🇹|🇧🇷/.test(text)) return 2; // bandera España/Portugal/Brasil sin marca latina
 	if (REJECT_RE.test(text)) return 2;
 	if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) return 1;
 	if (ESPANOL_RE.test(text)) return 1;
