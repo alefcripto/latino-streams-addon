@@ -154,7 +154,7 @@ function magnetInfoHash(magnet) {
 }
 
 // --- Detección de idioma / calidad ---
-const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|latinoam[eé]rica|dual[\s._-]*lat\b|wolfmax4k/i;
+const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|\blat\b|latinoam[eé]rica|dual[\s._-]*lat\b/i;
 // 🇪🇸 es castellano (España), NO latino: solo las banderas latinoamericanas cuentan
 function hasLatinoFlag(text) {
 	if (!/🇲🇽|🇦🇷|🇨🇴|🇨🇱|🇵🇪|🇻🇪|🇺🇾|🇪🇨/.test(text)) return false;
