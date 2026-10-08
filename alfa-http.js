@@ -196,6 +196,17 @@ function makeHtmlSource(id, name, mirrors, { searchPath, resultSelector, titleSe
 	};
 }
 
+async function resolveEmbed(embedUrl, referer) {
+	try {
+		const data = await getHtml(embedUrl, AH_PLAYER_MS, referer);
+		const file = /(?:file|src)\s*[:=]\s*["'](https?:[^"']+\.(?:m3u8|mp4)[^"']*)["']/i.exec(data);
+		if (file) return file[1];
+		const iframe = /<iframe[^>]+src=["'](https?:[^"']+)["']/i.exec(data);
+		if (iframe && !/recaptcha|google\.com|about:blank/i.test(iframe[1])) return iframe[1];
+	} catch { /* timeout u error: se usa el embed */ }
+	return null;
+}
+
 // ===========================================================================
 // ADAPTADORES MVP — traducidos de plugin.video.alfa/channels/*.py
 // Referencia: https://github.com/alfa-addon/addon
@@ -458,6 +469,78 @@ makeHtmlSource("sololatino", "SoloLatino",
 			return out;
 		},
 	});
+
+makeHtmlSource("pelisflix", "PelisFlix",
+	["https://pelisflix1.dog"],
+	{
+		searchPath: (q) => `/?s=${q}`,
+		resultSelector: "div.result-item article, article.item",
+		titleSelector: "h2",
+		linkSelector: "a",
+		extractTitle: ($el) => {
+			const t = $el.find("h2, h3").first().text().trim();
+			return t.replace(/\s*\(\d{4}\)\s*$/, "").trim(); // quitar año "(2018)"
+		},
+		getVideoUrls: async (pageUrl, { season, episode }) => {
+			const isSeries = season != null;
+			let url = pageUrl;
+			if (isSeries) {
+				if (!/\/serie\//.test(pageUrl)) return [];
+				const html0 = await getHtml(pageUrl, AH_DETAIL_MS);
+				const $0 = cheerio.load(html0);
+				let epHref = null;
+				// Patrón 1: enlaces con temporadaXepisodio en la URL (-1x05/, 1x05.html)
+				$0("a[href]").each((_, el) => {
+					if (epHref) return;
+					const href = $0(el).attr("href") || "";
+					const m = /-(\d+)x(\d+)(?:[\/.-]|$)/.exec(href) || /temporada-(\d+)-episodio-(\d+)/.exec(href);
+					if (m && parseInt(m[1], 10) === season && parseInt(m[2], 10) === (episode ?? 1)) {
+						epHref = href;
+					}
+				});
+				// Patrón 2: listado por temporada (div[data-season])
+				if (!epHref) {
+					$0(`div[data-season="${season}"] a`).each((_, el) => {
+						if (epHref) return;
+						const txt = $0(el).text().replace(/\s+/g, " ").trim();
+						const m = /(\d+)\s*$/.exec(txt) || /episodio\s*(\d+)/i.exec(txt);
+						if (m && parseInt(m[1], 10) === (episode ?? 1)) epHref = $0(el).attr("href");
+					});
+				}
+				if (!epHref) return [];
+				url = epHref.startsWith("http") ? epHref : new URL(epHref, pageUrl).href;
+			} else if (!/\/pelicula\//.test(pageUrl)) {
+				return [];
+			}
+			const html = await getHtml(url, AH_DETAIL_MS);
+			const $ = cheerio.load(html);
+			const opts = $("ul#playeroptionsul li[data-url], li.dooplay_player_option[data-url]")
+				.toArray().slice(0, 8);
+			const out = [];
+			await Promise.all(opts.map(async (li) => {
+				const raw = $(li).attr("data-url") || "";
+				let embed = null;
+				try { embed = Buffer.from(raw, "base64").toString("utf8").trim(); } catch { return; }
+				if (!/^https?:/.test(embed)) return;
+				const label = $(li).text().replace(/\s+/g, " ").trim();
+				if (/castellano|\bcast\b/i.test(label)) return; // solo latino
+				const resolved = await resolveEmbed(embed, url);
+				out.push({ url: resolved || embed, quality: parseQuality(label), server: label.slice(0, 30), language: "latino" });
+			}));
+			// Fallback: iframes sueltos cuyo contexto no indique castellano
+			if (!out.length) {
+				$("iframe[src]").each((_, el) => {
+					const src = $(el).attr("src") || "";
+					if (!/^https?:/.test(src)) return;
+					const ctx = $(el).closest("div").text();
+					if (/castellano/i.test(ctx)) return;
+					out.push({ url: src, quality: "HD", server: "", language: "latino" });
+				});
+			}
+			return out.slice(0, 8);
+		},
+	});
+
 
 // ---------------------------------------------------------------------------
 // NOTA HDFull: NO incluido en el MVP. El canal de Alfa requiere cuenta de

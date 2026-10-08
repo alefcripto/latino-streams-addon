@@ -155,21 +155,29 @@ function magnetInfoHash(magnet) {
 
 // --- Detección de idioma / calidad ---
 const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|latinoam[eé]rica|dual[\s._-]*lat\b|wolfmax4k/i;
-// 🇪🇸 solo cuenta como latino si NO es parte de una lista multi-idioma
+// 🇪🇸 es castellano (España), NO latino: solo las banderas latinoamericanas cuentan
 function hasLatinoFlag(text) {
-	if (!/🇪🇸/.test(text)) return false;
-	const flags = (text.match(/🇬🇧|🇮🇹|🇵🇹|🇫🇷|🇩🇪|🇳🇱|🇪🇸|🇲🇽|🇦🇷|🇨🇴/g) || []).length;
+	if (!/🇲🇽|🇦🇷|🇨🇴|🇨🇱|🇵🇪|🇻🇪|🇺🇾|🇪🇨/.test(text)) return false;
+	// Contar banderas de países; si hay 3+, es multi-idioma (subtítulos), no doblaje latino
+	const flags = (text.match(/🇬🇧|🇮🇹|🇵🇹|🇫🇷|🇩🇪|🇳🇱|🇪🇸|🇲🇽|🇦🇷|🇨🇴|🇨🇱|🇵🇪|🇻🇪|🇺🇾|🇪🇨/g) || []).length;
 	if (flags >= 3) return false;
 	return true;
 }
 const DUAL_RE = /\bdual\b/i;
 const SPAIN_RE = /castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish\s*\(spain\)/i;
 const HINDI_RE = /hindi|hind[ií]/i;
+// Rechazo explícito: portugués, castellano y solo-subtítulos nunca son latino
+const REJECT_RE = /portugu[eê]s|\bpt[\s._-]?br\b|\bdublad[oa]\b|\blegendad[oa]\b|🇧🇷|\bbrazilian\b|castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish|\bsubtitulad[oa]\b|\bvose\b/i;
+// Etiqueta genérica "español": probablemente latino si no hay marca de rechazo
+const ESPANOL_RE = /espa[ñn]ol/i;
 
 function latinoTier(text) {
 	if (HINDI_RE.test(text)) return -1; // excluir falsos "dual" hindi+eng
 	if (LATINO_RE.test(text) || hasLatinoFlag(text)) return 0;
+	if (/🇪🇸|🇵🇹|🇧🇷/.test(text)) return 2; // bandera España/Portugal/Brasil sin marca latina
+	if (REJECT_RE.test(text)) return 2;
 	if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) return 1;
+	if (ESPANOL_RE.test(text)) return 1;
 	return 2;
 }
 
@@ -222,6 +230,30 @@ function buildQueries(title) {
 	return queries.slice(0, 4);
 }
 
+
+// Búsqueda en paralelo: lanza todas las variantes de título a la vez
+// (antes eran secuenciales: hasta 4 × 6s = 24s de latencia peor caso).
+// Devuelve las tarjetas de la primera variante con coincidencias.
+async function searchParallel(title, mirrors, buildUrl, parseCards) {
+	for (const m of mirrors) {
+		const attempts = buildQueries(title).map((qq) => buildUrl(m, qq));
+		const lists = await Promise.all(
+			attempts.map(async (u) => {
+				try {
+					const res = await fetchWithTimeout(u, AT_TIMEOUT_MS, { headers: { "User-Agent": UA } });
+					if (!res.ok) return [];
+					return parseCards(cheerio.load(await res.text()), m);
+				} catch {
+					return [];
+				}
+			})
+		);
+		const matched = lists.flat().filter((c) => titleMatches(c.name, title));
+		if (matched.length) return { cards: matched, host: m };
+	}
+	return { cards: [], host: null };
+}
+
 // Decodifica URLs ofuscadas de EliteTorrent: base64 xN + ROT13
 // Devuelve URL absoluta (antepone baseHost si es ruta relativa)
 function decodeEliteTorrentUrl(obfuscated, baseHost) {
@@ -267,33 +299,21 @@ const SOURCES = {
 		name: "CineCalidad",
 		mirrors: ["https://www.cinecalidad.vg"],
 		async search(title, type) {
-			for (const m of this.mirrors) {
-				for (const qq of buildQueries(title)) {
-					try {
-						const q = encodeURIComponent(qq);
-						const res = await fetchWithTimeout(`${m}/?s=${q}`, AT_TIMEOUT_MS, {
-							headers: { "User-Agent": UA },
-						});
-						if (!res.ok) continue;
-						const $ = cheerio.load(await res.text());
-						const cards = [];
-						$("article").each((_, el) => {
-							const a = $(el).find("a").first();
-							const href = a.attr("href");
-							const img = $(el).find("img.w-full").first();
-							let name = img.attr("title") || img.attr("alt") || "";
-							name = name.split(" (")[0].trim();
-							if (/premium|promo/i.test(name)) return;
-							if (href && name) cards.push({ url: new URL(href, m).href, name });
-						});
-						const matched = cards.filter((c) => titleMatches(c.name, title));
-						if (matched.length) return { cards: matched, host: m };
-					} catch {
-						// siguiente query/espejo
-					}
-				}
-			}
-			return { cards: [], host: null };
+			return searchParallel(title, this.mirrors,
+				(m, qq) => `${m}/?s=${encodeURIComponent(qq)}`,
+				($, m) => {
+					const cards = [];
+					$("article").each((_, el) => {
+						const a = $(el).find("a").first();
+						const href = a.attr("href");
+						const img = $(el).find("img.w-full").first();
+						let name = img.attr("title") || img.attr("alt") || "";
+						name = name.split(" (")[0].trim();
+						if (/premium|promo/i.test(name)) return;
+						if (href && name) cards.push({ url: new URL(href, m).href, name });
+					});
+					return cards;
+				});
 		},
 		async detail(card) {
 			const rows = [];
@@ -344,38 +364,25 @@ const SOURCES = {
 		name: "EliteTorrent",
 		mirrors: ["https://www.elitetorrent.com"],
 		async search(title, type) {
-			for (const m of this.mirrors) {
-				for (const qq of buildQueries(title)) {
-					try {
-						const q = encodeURIComponent(qq);
-						const res = await fetchWithTimeout(`${m}/?s=${q}&x=0&y=0`, AT_TIMEOUT_MS, {
-							headers: { "User-Agent": UA },
-						});
-						if (!res.ok) continue;
-						const $ = cheerio.load(await res.text());
-						const cards = [];
-						$("ul.miniboxs-ficha li").each((_, el) => {
-							const a = $(el).find("div.imagen a").first();
-							const href = a.attr("href");
-							const name = (a.attr("title") || "").trim();
-							// Idioma desde la bandera: span[id] img[data-src] (ej. .../latino.png)
-							const flagImg = $(el).find("span[id] img").first();
-							const flagSrc = flagImg.attr("data-src") || flagImg.attr("src") || "";
-							const flagAlt = `${flagImg.attr("title") || ""} ${flagImg.attr("alt") || ""}`;
-							let lang = "";
-							if (/latino/i.test(flagSrc) || /latino/i.test(flagAlt)) lang = "Latino";
-							else if (/castellano/i.test(flagSrc) || /castellano/i.test(flagAlt)) lang = "Castellano";
-							else if (/vose|subtitul/i.test(flagSrc) || /vose|subtitul/i.test(flagAlt)) lang = "VOSE";
-							if (href && name) cards.push({ url: new URL(href, m).href, name, lang });
-						});
-						const matched = cards.filter((c) => titleMatches(c.name, title));
-						if (matched.length) return { cards: matched, host: m };
-					} catch {
-						// siguiente query/espejo
-					}
-				}
-			}
-			return { cards: [], host: null };
+			return searchParallel(title, this.mirrors,
+				(m, qq) => `${m}/?s=${encodeURIComponent(qq)}&x=0&y=0`,
+				($, m) => {
+					const cards = [];
+					$("ul.miniboxs-ficha li").each((_, el) => {
+						const a = $(el).find("div.imagen a").first();
+						const href = a.attr("href");
+						const name = (a.attr("title") || "").trim();
+						const flagImg = $(el).find("span[id] img").first();
+						const flagSrc = flagImg.attr("data-src") || flagImg.attr("src") || "";
+						const flagAlt = `${flagImg.attr("title") || ""} ${flagImg.attr("alt") || ""}`;
+						let lang = "";
+						if (/latino/i.test(flagSrc) || /latino/i.test(flagAlt)) lang = "Latino";
+						else if (/castellano/i.test(flagSrc) || /castellano/i.test(flagAlt)) lang = "Castellano";
+						else if (/vose|subtitul/i.test(flagSrc) || /vose|subtitul/i.test(flagAlt)) lang = "VOSE";
+						if (href && name) cards.push({ url: new URL(href, m).href, name, lang });
+					});
+					return cards;
+				});
 		},
 		async detail(card) {
 			const rows = [];
@@ -424,34 +431,20 @@ const SOURCES = {
 		name: "MiTorrent",
 		mirrors: ["https://mitorrent.mx"],
 		async search(title, type) {
-			for (const m of this.mirrors) {
-				for (const qq of buildQueries(title)) {
-					try {
-						const q = encodeURIComponent(qq);
-						const res = await fetchWithTimeout(
-							`${m}/search-result/?search_query=${q}&calidad=&genero=&dtyear=&audio=`,
-							AT_TIMEOUT_MS,
-							{ headers: { "User-Agent": UA } }
-						);
-						if (!res.ok) continue;
-						const $ = cheerio.load(await res.text());
-						const cards = [];
-						$("div.browse-movie-wrap").each((_, el) => {
-							const a = $(el).find("a").first();
-							const href = a.attr("href");
-							const name = $(el).find("div.browse-movie-bottom a").first().text().trim();
-							if (/1 a[ñn]o/i.test(name)) return;
-							const lang = $(el).find("div.browse-movie-tags").first().text().trim();
-							if (href && name) cards.push({ url: new URL(href, m).href, name, lang });
-						});
-						const matched = cards.filter((c) => titleMatches(c.name, title));
-						if (matched.length) return { cards: matched, host: m };
-					} catch {
-						// siguiente query/espejo
-					}
-				}
-			}
-			return { cards: [], host: null };
+			return searchParallel(title, this.mirrors,
+				(m, qq) => `${m}/search-result/?search_query=${encodeURIComponent(qq)}&calidad=&genero=&dtyear=&audio=`,
+				($, m) => {
+					const cards = [];
+					$("div.browse-movie-wrap").each((_, el) => {
+						const a = $(el).find("a").first();
+						const href = a.attr("href");
+						const name = $(el).find("div.browse-movie-bottom a").first().text().trim();
+						if (/1 a[ñn]o/i.test(name)) return;
+						const lang = $(el).find("div.browse-movie-tags").first().text().trim();
+						if (href && name) cards.push({ url: new URL(href, m).href, name, lang });
+					});
+					return cards;
+				});
 		},
 		async detail(card) {
 			const rows = [];
@@ -486,15 +479,14 @@ function makeWpJsonSource(name, mirrors) {
 		mirrors,
 		async search(title, type) {
 			for (const m of this.mirrors) {
-				for (const qq of buildQueries(title)) {
+				const attempts = buildQueries(title).map((qq) =>
+					`${m}/wp-json/wpreact/v1/search?query=${encodeURIComponent(qq)}&posts_per_page=20&page=1`);
+				const lists = await Promise.all(attempts.map(async (u) => {
 					try {
-						const q = encodeURIComponent(qq);
-						const res = await fetchWithTimeout(
-							`${m}/wp-json/wpreact/v1/search?query=${q}&posts_per_page=20&page=1`,
-							AT_TIMEOUT_MS,
-							{ headers: { "User-Agent": UA, Accept: "application/json" } }
-						);
-						if (!res.ok) continue;
+						const res = await fetchWithTimeout(u, AT_TIMEOUT_MS, {
+							headers: { "User-Agent": UA, Accept: "application/json" },
+						});
+						if (!res.ok) return [];
 						const j = await res.json();
 						const items = j?.results || j?.movies || j?.data || (Array.isArray(j) ? j : []);
 						const cards = [];
@@ -512,12 +504,13 @@ function makeWpJsonSource(name, mirrors) {
 								mediatype,
 							});
 						}
-						const matched = cards.filter((c) => titleMatches(c.name, title));
-						if (matched.length) return { cards: matched, host: m };
+						return cards;
 					} catch {
-						// siguiente query/espejo
+						return [];
 					}
-				}
+				}));
+				const matched = lists.flat().filter((c) => titleMatches(c.name, title));
+				if (matched.length) return { cards: matched, host: m };
 			}
 			return { cards: [], host: null };
 		},
@@ -688,8 +681,18 @@ async function fetchAlfaTorrentSource(sourceId, type, id, season, episode) {
 	}
 }
 
+async function fetchAlfaTorrentSourceCapped(sourceId, type, id, season, episode) {
+	return Promise.race([
+		fetchAlfaTorrentSource(sourceId, type, id, season, episode),
+		new Promise((resolve) => setTimeout(() => {
+			console.warn(`Torrent ${sourceId} descartado por latencia`);
+			resolve([]);
+		}, 7500)),
+	]);
+}
+
 module.exports = {
-	fetchAlfaTorrentSource,
+	fetchAlfaTorrentSource: fetchAlfaTorrentSourceCapped,
 	ALFA_TORRENT_SOURCES: Object.fromEntries(
 		Object.entries(SOURCES).map(([id, s]) => [id, s.name])
 	),

@@ -28,6 +28,7 @@ const HTTP_SOURCES_ENABLED = [
 	"pelisplus",
 	"entrepeliculasyseries",
 	"sololatino",
+	"pelisflix",
 ];
 
 // ---------------------------------------------------------------------------
