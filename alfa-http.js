@@ -252,7 +252,7 @@ makeHtmlSource("cuevana2espanol", "Cuevana2Español",
 //    Serie: {serieUrl}/season/S/episode/E (patrón determinista, sin JSON).
 // ---------------------------------------------------------------------------
 makeHtmlSource("pelisplus", "PelisPlus",
-	["https://ww3.pelisplus.to"],
+	["https://ww3.pelisplus.to", "https://pelisplus.live"],
 	{
 		searchPath: (q) => `/search/${q}`,
 		resultSelector: "article.item",
@@ -268,7 +268,7 @@ makeHtmlSource("pelisplus", "PelisPlus",
 			} else if (!/\/pelicula\//.test(pageUrl)) {
 				return [];
 			}
-			const mirror = "https://ww3.pelisplus.to";
+			const mirror = new URL(pageUrl).origin; // espejo que respondió en la búsqueda
 			const html = await getHtml(url, AH_DETAIL_MS);
 			const $ = cheerio.load(html);
 			const langAlt = ($("div.bg-tabs img[alt]").first().attr("alt") || "").trim();
