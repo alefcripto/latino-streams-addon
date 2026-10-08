@@ -204,7 +204,7 @@ function shortHash(s) {
 // ---------------------------------------------------------------------------
 // Detección de latino + parseo de calidad/seeders
 // ---------------------------------------------------------------------------
-const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|latinoam[eé]rica|dual[\s._-]*lat\b|wolfmax4k/i;
+const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\slat\s|\blat\b|latinoam[eé]rica|dual[\s._-]*lat\b|wolfmax4k/i;
 // 🇪🇸 es castellano (España), NO latino: solo las banderas latinoamericanas cuentan
 function hasLatinoFlag(text) {
 	if (!/🇲🇽|🇦🇷|🇨🇴|🇨🇱|🇵🇪|🇻🇪|🇺🇾|🇪🇨/.test(text)) return false;
@@ -215,6 +215,16 @@ function hasLatinoFlag(text) {
 }
 const DUAL_RE = /\bdual\b/i;
 const SPAIN_RE = /castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish\s*\(spain\)/i;
+// Rechazo explícito: portugués, castellano y solo-subtítulos nunca son latino
+const REJECT_RE = /portugu[eê]s|\bpt[\s._-]?br\b|\bdublad[oa]\b|\blegendad[oa]\b|🇧🇷|\bbrazilian\b|castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish|\bsubtitulad[oa]\b|\bvose\b/i;
+
+// Clasificación de idioma: 0 = latino confirmado, 1 = dual (probablemente latino), 2 = descartar
+function classifyTier(text) {
+	if (LATINO_RE.test(text) || hasLatinoFlag(text)) return 0;
+	if (REJECT_RE.test(text)) return 2;
+	if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) return 1;
+	return 2;
+}
 const SEEDERS_RE = /👤\s*([\d.,]+)/;
 const SIZE_RE = /💾\s*([\d.]+\s*[KMGT]B)/i;
 
@@ -233,10 +243,7 @@ function parseTorrentioStream(raw) {
 	const lower = text.toLowerCase();
 
 	// tier: 0 = latino confirmado, 1 = dual (probablemente latino), 2 = descartar
-	let tier = 2;
-	if (LATINO_RE.test(text) || hasLatinoFlag(text)) tier = 0;
-	else if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) tier = 1;
-	else if (SPAIN_RE.test(text)) tier = 2;
+	const tier = classifyTier(text);
 	if (tier === 2) return null;
 
 	const q = parseQuality(text);
@@ -337,9 +344,7 @@ async function fetchEZTV(type, id, season, episode) {
 			const text = `${t.filename || ""} ${t.title || ""}`;
 			const q = parseQuality(text);
 			const releaseName = (t.filename || t.title || "").slice(0, 120);
-			let tier = 2;
-			if (LATINO_RE.test(text)) tier = 0;
-			else if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) tier = 1;
+			const tier = classifyTier(text);
 			if (tier === 2 || !t.hash) return null;
 			return {
 				infoHash: String(t.hash).toLowerCase(),
@@ -600,9 +605,7 @@ async function fetchGranTorrent(type, id, season, episode) {
 				}
 				if (!infoHash) return;
 				const text = `${r.cardName}\n${r.rowText}\n${r.flag}`;
-				let tier = 2;
-				if (LATINO_RE.test(text)) tier = 0;
-				else if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) tier = 1;
+				const tier = classifyTier(text);
 				if (tier === 2) return;
 				const ql = parseQuality(text);
 				streams.push({
@@ -711,9 +714,7 @@ async function fetchTorznab(torznabUrl, torznabKey, type, id, season, episode) {
 			if (!infoHash) return null;
 
 			const q = parseQuality(title);
-			let tier = 2;
-			if (LATINO_RE.test(title)) tier = 0;
-			else if (DUAL_RE.test(title) && !SPAIN_RE.test(title)) tier = 1;
+			const tier = classifyTier(title);
 			if (tier === 2) return null;
 
 			return {

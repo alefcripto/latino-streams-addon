@@ -266,9 +266,9 @@ makeHtmlSource("pelisplus", "PelisPlus",
 			const $ = cheerio.load(html);
 			const langAlt = ($("div.bg-tabs img[alt]").first().attr("alt") || "").trim();
 			// Filtro de idioma a nivel página (la bandera aplica a las pestañas).
-			// Sitio latino por defecto: sin bandera o con "Latino" se acepta;
-			// solo se descarta si se identifica castellano.
-			if (/castellano/i.test(langAlt)) return [];
+			// Filtro estricto: se descarta si se identifica castellano, portugués o subtitulado.
+			// Sin marca de idioma se acepta (sitios latinos por defecto).
+			if (CASTELLANO_RE.test(langAlt) || REJECT_RE.test(langAlt)) return [];
 			const tabs = $("div.bg-tabs li[data-server]").slice(0, 6).toArray();
 			const out = [];
 			await Promise.all(tabs.map(async (el) => {
