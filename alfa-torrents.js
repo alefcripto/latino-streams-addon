@@ -167,15 +167,15 @@ const DUAL_RE = /\bdual\b/i;
 const SPAIN_RE = /castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish\s*\(spain\)/i;
 const HINDI_RE = /hindi|hind[ií]/i;
 // Rechazo explícito: portugués, castellano y solo-subtítulos nunca son latino
-const REJECT_RE = /portugu[eê]s|\bpt[\s._-]?br\b|\bdublad[oa]\b|\blegendad[oa]\b|🇧🇷|\bbrazilian\b|castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish|\bsubtitulad[oa]\b|\bvose\b/i;
+const REJECT_RE = /portugu[eê]s|\bpt[\s._-]?br\b|\bdublad[oa]\b|\blegendad[oa]\b|🇧🇷|🇵🇹|\bbrazilian\b|starckfilmes|\wfilmes\b|\blanternas\b|castellano|espa[ñn]a|\[esp\]|\(esp\)|spanish|\bsubtitulad[oa]\b|\bvose\b/i;
 // Etiqueta genérica "español": probablemente latino si no hay marca de rechazo
 const ESPANOL_RE = /espa[ñn]ol/i;
 
 function latinoTier(text) {
 	if (HINDI_RE.test(text)) return -1; // excluir falsos "dual" hindi+eng
+	if (REJECT_RE.test(text)) return 2; // rechazo explícito gana sobre marca latina
 	if (LATINO_RE.test(text) || hasLatinoFlag(text)) return 0;
 	if (/🇪🇸|🇵🇹|🇧🇷/.test(text)) return 2; // bandera España/Portugal/Brasil sin marca latina
-	if (REJECT_RE.test(text)) return 2;
 	if (DUAL_RE.test(text) && !SPAIN_RE.test(text)) return 1;
 	if (ESPANOL_RE.test(text)) return 1;
 	return 2;

@@ -115,15 +115,15 @@ async function fetchMeta(type, id) {
 const LATINO_RE = /latin[oa]|espa[ñn]ol[\s._-]*latin|audio[\s._-]*latin|\[lat\]|\(lat\)|\blat\b|latinoam[eé]rica|dual[\s._-]*lat\b/i;
 const CASTELLANO_RE = /castellano|\[esp\]|\(esp\)|espa[ñn]a/i;
 // Rechazo explícito: portugués y solo-subtítulos nunca son latino
-const REJECT_RE = /portugu[eê]s|\bpt[\s._-]?br\b|\bdublad[oa]\b|\blegendad[oa]\b|🇧🇷|\bbrazilian\b|\bsubtitulad[oa]\b|\bvose\b/i;
+const REJECT_RE = /portugu[eê]s|\bpt[\s._-]?br\b|\bdublad[oa]\b|\blegendad[oa]\b|🇧🇷|\bbrazilian\b|\bsubtitulad[oa]\b|\bvose\b|starckfilmes|\wfilmes\b|\blanternas\b|🇵🇹/i;
 // Etiqueta genérica "español": probablemente latino si no hay marca de rechazo
 const ESPANOL_RE = /espa[ñn]ol/i;
 
 function isLatino(text) {
 	if (!text) return false;
-	if (LATINO_RE.test(text)) return true; // marca latina explícita gana
+	if (REJECT_RE.test(text)) return false; // rechazo explícito gana
 	if (CASTELLANO_RE.test(text)) return false;
-	if (REJECT_RE.test(text)) return false;
+	if (LATINO_RE.test(text)) return true; // marca latina explícita
 	if (ESPANOL_RE.test(text)) return true; // "español" sin marcas de rechazo
 	return false;
 }
