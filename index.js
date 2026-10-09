@@ -873,6 +873,41 @@ async function _fetchAllSourcesInner(type, id, { season, episode, config, cacheK
 		);
 	}
 
+	// Búsqueda avanzada: si hay pocos latinos confirmados, segunda pasada
+	// con "latino" en la query para que las fuentes devuelvan más resultados latinos.
+	let tier0Count = 0;
+	for (const s of merged) if (s.tier === 0) tier0Count++;
+	const remain2 = GATHER_DEADLINE_MS - (Date.now() - t0);
+	if (tier0Count < 4 && remain2 > 3000) {
+		console.log(`Búsqueda avanzada: solo ${tier0Count} latinos, segunda pasada con "latino" (${remain2}ms restantes)`);
+		const jobs2 = [];
+		for (const [cfgKey, srcId] of [
+			["srcElitetorrent", "elitetorrent"],
+			["srcMitorrent", "mitorrent"],
+			["srcHacktorrent", "hacktorrent"],
+			["srcPelispanda", "pelispanda"],
+		]) {
+			if (config[cfgKey] !== false && !circuitOpen(srcId)) {
+				jobs2.push(
+					fetchAlfaTorrentSource(srcId, type, id, season, episode, " latino")
+						.then((list) => ({ name: srcId, list }))
+						.catch(() => ({ name: srcId, list: [] }))
+				);
+			}
+		}
+		const results2 = await Promise.all(jobs2);
+		for (const r of results2) {
+			for (const s of r.list || []) {
+				if (!s || seen.has(s.infoHash || s.url)) continue;
+				seen.add(s.infoHash || s.url);
+				merged.push(s);
+			}
+		}
+		// Salida temprana tras segunda pasada
+		tier0Count = 0;
+		for (const s of merged) if (s.tier === 0 && ++tier0Count >= EARLY_EXIT_TIER0) break;
+	}
+
 	// Filtrar solo latino y ordenar
 	const latino = merged.filter((s) => s.tier < 2).sort(rankStreams);
 	cacheSet(cacheKey, latino, 30 * 60 * 1000);
@@ -1137,9 +1172,22 @@ async function _streamHandlerInner({ type, id, config }) {
 				},
 			}),
 			HTTP_SOURCES_ENABLED.length
-				? withSingleFlight(`sf:http:${type}:${id}`, () =>
-					fetchAllHttpSources(type, id, season, episode, HTTP_SOURCES_ENABLED).catch(() => [])
-				)
+				? withSingleFlight(`sf:http:${type}:${id}`, async () => {
+					const first = await fetchAllHttpSources(type, id, season, episode, HTTP_SOURCES_ENABLED).catch(() => []);
+					// Búsqueda avanzada: si hay pocos resultados, segunda pasada con "latino"
+					if (first.length < 4) {
+						console.log(`Búsqueda avanzada HTTP: solo ${first.length} streams, segunda pasada con "latino"`);
+						const second = await fetchAllHttpSources(type, id, season, episode, HTTP_SOURCES_ENABLED, " latino").catch(() => []);
+						const seenUrls = new Set(first.map(s => s.url));
+						for (const s of second) {
+							if (s && s.url && !seenUrls.has(s.url)) {
+								seenUrls.add(s.url);
+								first.push(s);
+							}
+						}
+					}
+					return first;
+				})
 				: Promise.resolve([]),
 		]);
 

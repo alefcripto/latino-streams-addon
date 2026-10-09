@@ -583,21 +583,21 @@ async function resolveInfoHash(row) {
 	return null;
 }
 
-async function fetchAlfaTorrentSource(sourceId, type, id, season, episode) {
+async function fetchAlfaTorrentSource(sourceId, type, id, season, episode, querySuffix = "") {
 	const src = SOURCES[sourceId];
 	if (!src) return [];
-	const cacheKey = `alfa-torrent:${sourceId}:${type}:${id}`;
+	const cacheKey = `alfa-torrent:${sourceId}:${type}:${id}:${querySuffix}`;
 	const hit = cacheGet(cacheKey);
 	if (hit) return hit;
 
 	try {
 		const meta = await fetchMeta(type, id);
 		if (!meta) return [];
-		const title = meta.name;
+		const title = meta.name + querySuffix;
 		const year = meta.year;
 
 		const { cards } = await src.search(title, type);
-		let matched = cards.filter((c) => titleMatches(c.name, title)).slice(0, 5);
+		let matched = cards.filter((c) => titleMatches(c.name, meta.name)).slice(0, 5);
 		if (!matched.length) {
 			cacheSet(cacheKey, [], 30 * 60 * 1000);
 			return [];

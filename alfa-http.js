@@ -929,11 +929,11 @@ SOURCES["animejara"] = {
 // ---------------------------------------------------------------------------
 // Orquestador principal
 // ---------------------------------------------------------------------------
-async function fetchAlfaHttpSource(sourceId, type, id, season, episode) {
+async function fetchAlfaHttpSource(sourceId, type, id, season, episode, querySuffix = "") {
 	const src = SOURCES[sourceId];
 	if (!src) return [];
 
-	const cacheKey = `ah:${sourceId}:${type}:${id}`;
+	const cacheKey = `ah:${sourceId}:${type}:${id}:${querySuffix}`;
 	const hit = cacheGet(cacheKey);
 	if (hit) return hit;
 
@@ -941,7 +941,7 @@ async function fetchAlfaHttpSource(sourceId, type, id, season, episode) {
 		const meta = await fetchMeta(type, id);
 		if (!meta) return [];
 
-		const searchResults = await src.search(meta.name, meta.year);
+		const searchResults = await src.search(meta.name + querySuffix, meta.year);
 		if (!searchResults.length) return [];
 
 		// Obtener URLs de video de cada resultado (en paralelo, max 3)
@@ -984,9 +984,9 @@ function withTimeout(promise, ms) {
 }
 
 // Fetch paralelo de múltiples fuentes HTTP con cap global por fuente
-async function fetchAllHttpSources(type, id, season, episode, sourceIds) {
+async function fetchAllHttpSources(type, id, season, episode, sourceIds, querySuffix = "") {
 	const jobs = sourceIds.map(srcId =>
-		withTimeout(fetchAlfaHttpSource(srcId, type, id, season, episode), AH_SOURCE_CAP_MS)
+		withTimeout(fetchAlfaHttpSource(srcId, type, id, season, episode, querySuffix), AH_SOURCE_CAP_MS)
 			.catch((e) => {
 				console.warn(`HTTP ${srcId} descartado por latencia:`, e.message);
 				return [];
