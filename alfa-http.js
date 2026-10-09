@@ -541,6 +541,383 @@ makeHtmlSource("pelisflix", "PelisFlix",
 		},
 	});
 
+makeHtmlSource("repelishd", "RepelisHD",
+	["https://repelishd.cam"],
+	{
+		searchPath: (q) => `/index.php?do=search&subaction=search&search_start=1&story=${q}`,
+		resultSelector: "div.card",
+		titleSelector: "img",
+		linkSelector: "a",
+		extractTitle: ($el) => ($el.find("img").attr("alt") || "").trim(),
+		getVideoUrls: async (pageUrl, { season, episode }) => {
+			const isSeries = season != null;
+			const html = await getHtml(pageUrl, AH_DETAIL_MS);
+			const $ = cheerio.load(html);
+			const out = [];
+			if (isSeries) {
+				let section = null;
+				$(`a[id="serie-${season}_${episode ?? 1}"]`).each((_, el) => { if (!section) section = $(el).parent(); });
+				if (!section) return [];
+				section.find("div.mirrors a[data-link]").each((_, a) => {
+					let url = $(a).attr("data-link") || "";
+					if (url.startsWith("//")) url = "https:" + url;
+					if (/verhdlink/i.test(url)) return;
+					if (url) out.push({ url, quality: "HD", server: $(a).text().trim(), language: "latino" });
+				});
+			} else {
+				const iframe = $("div.player_contenedor iframe").first().attr("src");
+				if (!iframe) return [];
+				const src = iframe.startsWith("http") ? iframe : "https:" + iframe;
+				try {
+					const pdata = await getHtml(src, AH_PLAYER_MS, pageUrl);
+					const $p = cheerio.load(pdata);
+					// Solo el ul de idioma latino (class "latino" según CUSTOM_FILTER)
+					$p("ul._player-mirrors.latino li, ul.latino li").each((_, li) => {
+						let url = $(li).attr("data-link") || "";
+						if (url.startsWith("//")) url = "https:" + url;
+						if (/verhdlink/i.test(url)) return;
+						if (url) out.push({ url, quality: "HD", server: $(li).text().trim(), language: "latino" });
+					});
+					// Si no hay marcador de idioma, todos los mirrors
+					if (!out.length) {
+						$p("ul._player-mirrors li").each((_, li) => {
+							let url = $(li).attr("data-link") || "";
+							if (url.startsWith("//")) url = "https:" + url;
+							if (url && !/verhdlink/i.test(url)) out.push({ url, quality: "HD", server: $(li).text().trim(), language: "latino" });
+						});
+					}
+				} catch {
+					out.push({ url: src, quality: "HD", server: "", language: "latino" });
+				}
+			}
+			return out;
+		},
+	});
+
+makeHtmlSource("pelisforte", "PelisForte",
+	["https://www2.pelisforte.se"],
+	{
+		searchPath: (q) => `/page/1?s=${q}`,
+		resultSelector: "ul.post-lst li[class^='post-']",
+		titleSelector: "h2",
+		linkSelector: "a",
+		getVideoUrls: async (pageUrl) => {
+			const html = await getHtml(pageUrl, AH_DETAIL_MS);
+			const $ = cheerio.load(html);
+			const player = $("section.player");
+			const iframes = player.find("iframe").toArray();
+			const servers = player.find("span.server").toArray();
+			const out = [];
+			iframes.slice(0, 8).forEach((el, i) => {
+				let url = $(el).attr("data-src") || $(el).attr("src") || "";
+				if (!url) return;
+				url = url.replace("?h=", "r.php?h=");
+				if (url.startsWith("//")) url = "https:" + url;
+				const srvTxt = servers[i] ? $(servers[i]).text().trim() : "";
+				const parts = srvTxt.split("-");
+				const lang = (parts[1] || "").trim();
+				if (/castellano/i.test(lang)) return; // solo latino
+				const resolved = null; // la página r.php redirige; el embed sirve
+				out.push({ url, quality: "HD", server: (parts[0] || "").trim(), language: "latino" });
+			});
+			return out;
+		},
+	});
+
+makeHtmlSource("homecine", "HomeCine",
+	["https://www3.homecine.to"],
+	{
+		searchPath: (q) => `/?s=${q}`,
+		resultSelector: "div.movies-list div[data-movie-id]",
+		titleSelector: "h2",
+		linkSelector: "a",
+		getVideoUrls: async (pageUrl, { season, episode }) => {
+			const isSeries = season != null;
+			const html = await getHtml(pageUrl, AH_DETAIL_MS);
+			const $ = cheerio.load(html);
+			const out = [];
+			if (isSeries) {
+				if (!/\/series\//.test(pageUrl)) return [];
+				const blocks = $("div.les-content").toArray();
+				const block = blocks[(season ?? 1) - 1];
+				if (!block) return [];
+				let epUrl = null;
+				$(block).find("a").each((_, a) => {
+					if (epUrl) return;
+					const t = $(a).text().replace("Episode", "").trim();
+					if (parseInt(t, 10) === (episode ?? 1)) epUrl = $(a).attr("href");
+				});
+				if (!epUrl) return [];
+				return SOURCES.homecine.getVideoUrls(
+					epUrl.startsWith("http") ? epUrl : new URL(epUrl, pageUrl).href,
+					{ season: null, episode: null });
+			}
+			// Película (o página de episodio): pestañas de idioma + iframes
+			const tabs = $("div[id^='tab']").toArray();
+			const langs = $("a[href^='#tab']").toArray()
+				.map((a) => $(a).text().replace(/\s+/g, " ").trim());
+			tabs.slice(0, 6).forEach((tab, i) => {
+				const langTxt = langs[i] || "";
+				if (/castellano/i.test(langTxt)) return;
+				if (/sub|vose/i.test(langTxt) && !/lat/i.test(langTxt)) return;
+				const src = $(tab).find("iframe").first().attr("src") || "";
+				if (!src) return;
+				const url = src.startsWith("http") ? src : new URL(src, pageUrl).href;
+				out.push({ url, quality: "HD", server: langTxt.split("-").pop() || "", language: "latino" });
+			});
+			return out;
+		},
+	});
+
+SOURCES["lamovie"] = {
+	id: "lamovie",
+	name: "LaMovie",
+	mirrors: ["https://lamovie.org"],
+	_langIds: { "58651": "latino", "58652": "ingles", "58653": "castellano", "58654": "japones", "58655": "subtitulado" },
+	async _api(path) {
+		const res = await fetchWithTimeout(this.mirrors[0] + path, AH_SEARCH_MS, {
+			headers: { "User-Agent": UA, Referer: this.mirrors[0] },
+		});
+		if (!res.ok) return null;
+		return await res.json().catch(() => null);
+	},
+	_isLatinoItem(item) {
+		const langs = (item.lang || []).map((l) => this._langIds[String(l)] || "");
+		if (!langs.length) return true; // default del sitio: latino
+		return langs.includes("latino");
+	},
+	async search(title) {
+		const j = await this._api(`/wp-api/v1/search?filter=%7B%7D&postType=any&q=${encodeURIComponent(title)}&postsPerPage=26`);
+		const posts = j?.data?.posts || [];
+		const out = [];
+		for (const p of posts) {
+			const t = (p.original_title || "").trim();
+			if (!t || !this._isLatinoItem(p)) continue;
+			if (!titleMatch(title, t)) continue;
+			out.push({ pageUrl: String(p._id), title: t, kind: (p.type || "").replace(/s$/, ""), langs: p.lang });
+		}
+		return out.slice(0, 5);
+	},
+	async getVideoUrls(pageUrl, { season, episode, title }) {
+		// pageUrl trae el _id; re-buscamos para saber el tipo
+		const j = await this._api(`/wp-api/v1/search?filter=%7B%7D&postType=any&q=${encodeURIComponent(title || "")}&postsPerPage=26`);
+		const me = (j?.data?.posts || []).find((p) => String(p._id) === String(pageUrl) && this._isLatinoItem(p));
+		const kind = me ? (me.type || "").replace(/s$/, "") : "movie";
+		let postId = pageUrl;
+		if (kind !== "movie" && season != null) {
+			const eps = await this._api(`/wp-api/v1/single/episodes/list?_id=${pageUrl}&season=${season}&page=1&postsPerPage=15`);
+			const ep = (eps?.data?.posts || []).find((e) =>
+				parseInt(e.season_number, 10) === season && parseInt(e.episode_number, 10) === (episode ?? 1));
+			if (!ep) return [];
+			postId = String(ep._id);
+		}
+		const links = await this._api(`/wp-api/v1/player?postId=${postId}&demo=0`);
+		const vids = [...(links?.data?.embeds || []), ...(links?.data?.downloads || [])];
+		const out = [];
+		for (const v of vids.slice(0, 10)) {
+			if (!v.url || /html\?v=1/.test(v.url)) continue;
+			const lang = (v.lang || "").replace("Latino/Inglés", "DUAL");
+			if (/castellano/i.test(lang) || /subtitul/i.test(lang)) continue;
+			if (/ingl|japones/i.test(lang) && !/latino|dual/i.test(lang)) continue;
+			out.push({ url: v.url, quality: v.quality || "HD", server: "", language: "latino" });
+		}
+		return out;
+	},
+};
+
+SOURCES["flizzmovies"] = {
+	id: "flizzmovies",
+	name: "FlizzMovies",
+	mirrors: ["https://flizzmovies.org"],
+	async search(title) {
+		for (const m of this.mirrors) {
+			try {
+				const res = await fetchWithTimeout(m, AH_SEARCH_MS, {
+					method: "POST",
+					headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
+					body: `s=${encodeURIComponent(title)}`,
+				});
+				if (!res.ok) continue;
+				const $ = cheerio.load(await res.text());
+				const out = [];
+				$("ul.container_cards a").each((_, el) => {
+					const t = ($(el).find("div.card_title p").first().text() || "").trim();
+					const href = $(el).attr("href") || "";
+					if (t && href && titleMatch(title, t)) {
+						out.push({ pageUrl: href.startsWith("http") ? href : new URL(href, m).href, title: t });
+					}
+				});
+				if (out.length) return out.slice(0, 5);
+			} catch { /* siguiente mirror */ }
+		}
+		return [];
+	},
+	async getVideoUrls(pageUrl) {
+		const html = await getHtml(pageUrl, AH_DETAIL_MS);
+		const $ = cheerio.load(html);
+		const btns = $("div.options a.reportbtn").toArray().slice(0, 8);
+		const out = [];
+		await Promise.all(btns.map(async (el) => {
+			const lang = ($(el).attr("data-lang") || "").toLowerCase();
+			if (/castellano|subtitul/.test(lang)) return;
+			const id = $(el).attr("data-id");
+			const num = $(el).attr("data-num");
+			if (!id || !num) return;
+			try {
+				const res = await fetchWithTimeout(pageUrl, AH_PLAYER_MS, {
+					method: "POST",
+					headers: {
+						"User-Agent": UA,
+						"Content-Type": "application/x-www-form-urlencoded",
+						"X-Requested-With": "XMLHttpRequest",
+						Referer: pageUrl,
+					},
+					body: `idF=${encodeURIComponent(id)}&ajax=${encodeURIComponent(num)}`,
+				});
+				const j = await res.json().catch(() => null);
+				if (j?.link) {
+					out.push({ url: j.link, quality: "HD", server: $(el).attr("data-server") || "", language: "latino" });
+				}
+			} catch { /* botón roto */ }
+		}));
+		return out;
+	},
+};
+
+makeHtmlSource("cine24h", "Cine24H",
+	["https://cine24h.online"],
+	{
+		searchPath: (q) => `/?s=${q}`,
+		resultSelector: "article",
+		titleSelector: "div.Title, h3, h2",
+		linkSelector: "a",
+		extractTitle: ($el) => {
+			const t = $el.find("div.Title").first().text().trim()
+				|| $el.find("h3").first().text().trim()
+				|| $el.find("h2").first().text().trim();
+			return t;
+		},
+		getVideoUrls: async (pageUrl, { season, episode }) => {
+			const isSeries = season != null;
+			let url = pageUrl;
+			if (isSeries) {
+				if (!/series|serie/.test(pageUrl)) return [];
+				const html0 = await getHtml(pageUrl, AH_DETAIL_MS);
+				const $0 = cheerio.load(html0);
+				const box = $0("div.AABox").toArray()[(season ?? 1) - 1];
+				if (!box) return [];
+				let epUrl = null;
+				$0(box).find("a.MvTbImg").each((_, a) => {
+					if (epUrl) return;
+					const m = /x(\d+)/.exec($(a).attr("href") || "");
+					if (m && parseInt(m[1], 10) === (episode ?? 1)) epUrl = $(a).attr("href");
+				});
+				if (!epUrl) return [];
+				url = epUrl.startsWith("http") ? epUrl : new URL(epUrl, pageUrl).href;
+			}
+			const html = await getHtml(url, AH_DETAIL_MS);
+			const $ = cheerio.load(html);
+			const out = [];
+			const groups = $("div.drpdn").toArray();
+			await Promise.all(groups.map(async (g) => {
+				const langTxt = $(g).find("span").first().text().trim();
+				let lang = "";
+				if (/LAT/i.test(langTxt)) lang = "lat";
+				else if (/ESP/i.test(langTxt)) lang = "cast";
+				else if (/SUB/i.test(langTxt)) lang = "vose";
+				if (lang && lang !== "lat") return; // solo latino
+				const items = $(g).find("li[data-src]").toArray().slice(0, 3);
+				for (const li of items) {
+					const raw = $(li).attr("data-src") || "";
+					let embed = null;
+					try { embed = Buffer.from(raw, "base64").toString("utf8").replace(/amp;|#038;/g, ""); } catch { continue; }
+					if (!/^https?:/.test(embed)) continue;
+					const vid = await resolveEmbed(embed, url);
+					out.push({ url: vid || embed, quality: "HD", server: "", language: "latino" });
+				}
+			}));
+			return out;
+		},
+	});
+
+SOURCES["animejara"] = {
+	id: "animejara",
+	name: "AnimeJara",
+	mirrors: ["https://animejara.com"],
+	_lang(s) {
+		s = (s || "").toLowerCase();
+		if (s.includes("latino")) return "latino";
+		if (s.includes("castellano")) return "castellano";
+		return "vose";
+	},
+	async search(title) {
+		for (const m of this.mirrors) {
+			try {
+				const res = await fetchWithTimeout(`${m}catalogo/?q=${encodeURIComponent(title)}`, AH_SEARCH_MS, {
+					headers: { "User-Agent": UA },
+				});
+				if (!res.ok) continue;
+				const $ = cheerio.load(await res.text());
+				const out = [];
+				$("a.anime-card").each((_, el) => {
+					const t = ($(el).find("h3.card-title").first().text() || "").trim();
+					if (!t || !titleMatch(title, t)) return;
+					const langs = $(el).find("img.lang-icon").toArray()
+						.map((i) => this._lang($(i).attr("alt"))).filter((l) => l === "latino");
+					if (!langs.length) return; // solo doblaje latino
+					const href = $(el).attr("href") || "";
+					const isMovie = /pelicula/i.test($(el).find("span.meta-type").first().text() || "");
+					out.push({
+						pageUrl: href.startsWith("http") ? href : new URL(href, m).href,
+						title: t,
+						kind: isMovie ? "movie" : "series",
+					});
+				});
+				if (out.length) return out.slice(0, 5);
+			} catch { /* siguiente mirror */ }
+		}
+		return [];
+	},
+	async getVideoUrls(pageUrl, { season, episode }) {
+		let url = pageUrl;
+		const isSeries = season != null;
+		if (isSeries) {
+			const html0 = await getHtml(pageUrl, AH_DETAIL_MS);
+			const slugM = /ANIME_SLUG\s*=\s*'([^']+)'/.exec(html0);
+			const dataM = /TEMPORADAS_DATA\s*=\s*(\[[\s\S]*?\]);/.exec(html0);
+			if (!slugM || !dataM) return [];
+			try {
+				const temps = JSON.parse(dataM[1]);
+				const slug = slugM[1];
+				const temp = temps.find((t) => parseInt(t.numero_temporada, 10) === season);
+				const ep = (temp?.episodios || []).find((e) => parseInt(e.numero_episodio, 10) === (episode ?? 1));
+				if (!ep) return [];
+				const langs = (ep.idiomas || []).map((l) => this._lang(l));
+				if (langs.length && !langs.includes("latino")) return [];
+				url = `https://animejara.com/episode/${slug}-${season}x${episode ?? 1}/`;
+			} catch { return []; }
+		}
+		const html = await getHtml(url, AH_DETAIL_MS);
+		const $ = cheerio.load(html);
+		const out = [];
+		const langNames = $("div.botones-idioma div.lang-name").toArray()
+			.map((d) => this._lang($(d).text()));
+		const iframes = $("div.player, div#player, iframe").toArray()
+			.map((el) => $(el).attr("src") || ($(el).is("iframe") ? $(el).attr("data-src") : ""))
+			.filter(Boolean);
+		// Emparejar iframes con idiomas en orden; sin marcador, aceptar
+		iframes.slice(0, 8).forEach((src0, i) => {
+			const lang = langNames[i];
+			if (lang && lang !== "latino") return;
+			const src = src0.startsWith("http") ? src0 : new URL(src0, url).href;
+			if (/hqq|netuplayer|krakenfiles/i.test(src)) return;
+			out.push({ url: src, quality: "HD", server: "", language: "latino" });
+		});
+		return out;
+	},
+};
+
+
 
 // ---------------------------------------------------------------------------
 // NOTA HDFull: NO incluido en el MVP. El canal de Alfa requiere cuenta de

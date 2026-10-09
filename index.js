@@ -29,6 +29,13 @@ const HTTP_SOURCES_ENABLED = [
 	"entrepeliculasyseries",
 	"sololatino",
 	"pelisflix",
+	"repelishd",
+	"pelisforte",
+	"homecine",
+	"lamovie",
+	"flizzmovies",
+	"cine24h",
+	"animejara",
 ];
 
 // ---------------------------------------------------------------------------
@@ -102,6 +109,12 @@ const manifest = {
 			key: "srcHacktorrent",
 			type: "checkbox",
 			title: "Fuente: HackTorrent (torrents latino — pelis y series)",
+			default: "checked",
+		},
+		{
+			key: "srcPelispanda",
+			type: "checkbox",
+			title: "Fuente: PelisPanda (torrents latino — pelis y series)",
 			default: "checked",
 		},
 		{
@@ -760,7 +773,7 @@ async function fetchTorznab(torznabUrl, torznabKey, type, id, season, episode) {
 
 // Orquesta todas las fuentes en paralelo, con fallback automático
 async function fetchAllSources(type, id, { season, episode, config }) {
-	const cacheKey = `all:${type}:${id}:${config.srcTorrentio ? 1 : 0}${config.srcEztv ? 1 : 0}${config.srcGrantorrent ? 1 : 0}${config.srcElitetorrent ? 1 : 0}${config.srcMitorrent ? 1 : 0}${config.srcHacktorrent ? 1 : 0}:${shortHash(config.extraSources)}:${shortHash(config.torznabUrl)}`;
+	const cacheKey = `all:${type}:${id}:${config.srcTorrentio ? 1 : 0}${config.srcEztv ? 1 : 0}${config.srcGrantorrent ? 1 : 0}${config.srcElitetorrent ? 1 : 0}${config.srcMitorrent ? 1 : 0}${config.srcHacktorrent ? 1 : 0}${config.srcPelispanda ? 1 : 0}:${shortHash(config.extraSources)}:${shortHash(config.torznabUrl)}`;
 	const hit = cacheGet(cacheKey);
 	if (hit) return hit.val;
 
@@ -806,6 +819,7 @@ async function _fetchAllSourcesInner(type, id, { season, episode, config, cacheK
 		["srcElitetorrent", "elitetorrent"],
 		["srcMitorrent", "mitorrent"],
 		["srcHacktorrent", "hacktorrent"],
+		["srcPelispanda", "pelispanda"],
 	]) {
 		if (config[cfgKey] !== false) {
 			addJob(srcId, fetchAlfaTorrentSource(srcId, type, id, season, episode));
@@ -1070,7 +1084,7 @@ function streamCacheKey(type, id, config) {
 		tb: c.torboxKey ? shortHash(c.torboxKey) : "-",
 		io: c.instantOnly !== false ? 1 : 0,
 		mx: String(c.maxResults || "8"),
-		src: ["srcTorrentio", "srcEztv", "srcGrantorrent", "srcElitetorrent", "srcMitorrent", "srcHacktorrent"]
+		src: ["srcTorrentio", "srcEztv", "srcGrantorrent", "srcElitetorrent", "srcMitorrent", "srcHacktorrent", "srcPelispanda"]
 			.map((k) => (c[k] === false ? 0 : 1)).join(""),
 		ex: shortHash(c.extraSources || ""),
 		tz: shortHash((c.torznabUrl || "").trim()),
@@ -1116,6 +1130,7 @@ async function _streamHandlerInner({ type, id, config }) {
 					srcElitetorrent: config.srcElitetorrent !== false,
 					srcMitorrent: config.srcMitorrent !== false,
 					srcHacktorrent: config.srcHacktorrent !== false,
+				srcPelispanda: config.srcPelispanda !== false,
 					extraSources: config.extraSources || "",
 					torznabUrl: (config.torznabUrl || "").trim(),
 					torznabKey: config.torznabKey || "",

@@ -558,6 +558,7 @@ function makeWpJsonSource(name, mirrors) {
 
 SOURCES.hacktorrent = makeWpJsonSource("HackTorrent", ["https://hacktorrent.cc", "https://hacktorrent.to"]);
 SOURCES.pelispanda = makeWpJsonSource("PelisPanda", ["https://pelispanda.org"]);
+SOURCES.pelispanda = makeWpJsonSource("PelisPanda", ["https://pelispanda.org"]);
 
 // ---------------------------------------------------------------------------
 // Orquestador: busca en una fuente y devuelve streams estilo Stremio
